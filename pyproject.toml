@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "clipper-remaster"
+version = "0.1.0a1"
+description = "Desktop replay clipping and video library"
+requires-python = ">=3.10"
+dependencies = ["PyQt6>=6.6,<7", "websockets>=12,<16", "dbus-next>=0.2.3; sys_platform == 'linux'"]
+
+[project.gui-scripts]
+clipper = "clipper.app:main"
+
+[tool.setuptools.packages.find]
+include = ["clipper*"]
+
+[tool.setuptools.package-data]
+clipper = ["assets/icons/*.png", "assets/icons/*.txt"]
