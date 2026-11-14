@@ -1,12 +1,19 @@
-# Clipper remaster
+# Clipper
 
-Clipper is a replay-clipping and video-library desktop application. **This project is still in development:** Windows is the primary target, but the Windows capture path, packaging, shortcuts, and startup integration have not yet been tested on a real Windows machine. Linux capture still needs broader hardware testing, and Wayland shortcut activation needs interactive end-to-end verification.
+Clipper is a dark/orange, keyboard-friendly replay-clipping and video-library desktop application for **Windows and Linux**. It is a multiplatform remaster of the original school project, with non-destructive editing, independent audio tracks, OBS support and a native Qt interface.
 
-The current code provides a library grouping originals, trims and exports; tags, thumbnails and legacy metadata import; an editor with playback, trim points and per-track audio levels; size-limited exports; and replay-buffer control through OBS Studio. On Linux there is also a GPU Screen Recorder adapter. Both backends need the corresponding recorder installed; Clipper does not yet bundle OBS.
+## What is included
 
-The desktop interface is split into **Knihovna**, **Nahrávání**, and **Nastavení**. On Linux, choose OBS Studio or GPU Screen Recorder in the recording tab. Hover over a card for a silent video preview of its saved trim range. For formats that Qt cannot play directly, a short temporary preview is generated; if that fails, the thumbnail stays visible. Select a clip to see its versions and actions, or double-click it to open the editor. The right-click menu provides tag selection, copying files or exports, and batch deletion of exports or originals that have a retained trim.
+- **Replay recording:** OBS Studio on Windows and Linux, plus GPU Screen Recorder on Linux. Start/stop the replay buffer, save a clip, use global shortcuts and see a live screen/OBS preview and clear recording status.
+- **GSR audio:** a usable default output on a fresh installation, selectable PulseAudio/PipeWire devices, custom track names, independent 0–150 % levels and track ordering. Names and levels are carried into the editor metadata; video is not re-encoded after recording.
+- **Library:** responsive cards, silent hover previews, version grouping, tags and colors, search and match highlighting, date-aware ordering, multi-selection, clipboard actions, safe deletion and a details/actions panel.
+- **Editor:** Qt Multimedia playback, frame stepping, speed, persistent master volume, per-track waveforms and independent levels, accurate IN/OUT controls and autoplay from the saved IN point. Exported files can open in a restricted playback-only mode.
+- **Processing:** lossless video trims with appropriate audio handling, two-pass compressed exports, saved size presets/preferences, progress and cancellation. Outputs are committed atomically so a failure or cancellation does not replace an existing destination.
+- **Compatibility:** seekable H.264 previews for unsupported codecs and synchronized independent-track audio. Files with a pre-mixed first track can be marked accordingly.
+- **Desktop integration:** optional tray controls, start on login, automatic replay activation, Windows DPAPI password storage and saved window geometry/scale.
+- **Migration:** imports old clips, tags, trims, track names/volumes, recording configuration, hotkeys, master volume, export preference, startup preference and window geometry without changing the original `config.json`.
 
-The legacy import supports both the old top-level metadata maps and the later per-clip format, including trim ranges, tags, track volumes and track names. It matches files by name in the chosen folder and leaves the original configuration untouched.
+The interface is split into **Nahrávání**, **Knihovna** and **Nastavení**, and opens in the library like the original. Select a clip to see versions and actions, or double-click it to open the editor. Right-click offers the complete batch, tag, export, copy and deletion menu. `Ctrl+F` focuses library search, `Escape` clears selection, and `I`/`O` set IN/OUT in the editor.
 
 ## Run from source
 
@@ -17,11 +24,32 @@ python -m pip install -e .
 python -m clipper
 ```
 
-Use “Zkontrolovat aplikaci…” in Nastavení to check FFmpeg, encoder availability, recorder startup and the OBS WebSocket connection. Choose the clips folder in Knihovna. On Windows, enable the OBS WebSocket server and enter its password in Nahrávání. The experimental setup action creates and activates a separate `Clipper Capture` profile and scene, configures the replay buffer and creates screen and audio sources. The recording setup offers display capture or fullscreen game capture, two standard audio sources and up to three additional input/output devices, each recorded to a separate track alongside the compatibility mix. Extra track labels are stored in the Clipper library and follow trims. The source selector can choose available devices. Fullscreen game capture requires a compatible game and OBS hook; check the preview for the game you intend to record. Setup refuses to switch profiles while an OBS output is active. OBS startup, the app's login startup, password storage using Windows DPAPI, and global hotkeys are opt-in.
+To also install the optional Linux `evdev` backend for global shortcuts:
 
-On Linux, the system shortcuts button asks the desktop portal to register shortcuts. It creates a per-user desktop entry for the application identity. Support depends on the desktop environment and portal. GPU Screen Recorder must be compatible with the system libraries and graphics driver.
+```sh
+python -m pip install -e '.[linux-hotkeys]'
+python -m clipper
+```
 
-When a replay is saved in the selected clips folder, Clipper names it after the active window, as in the original application. Window detection uses the Windows foreground window or, on Linux, `hyprctl`, `kdotool`, or `xdotool` depending on the desktop; if no title is available, it uses `Desktop`. The saved file is left under its original name if safe renaming is unavailable or OBS saves it outside the selected clips folder.
+On Windows the standard installation already includes everything needed by the OBS integration. Choose the clips folder in Knihovna/Nastavení and use “Zkontrolovat aplikaci…” to check FFmpeg, encoder availability, recorder startup and the OBS WebSocket connection.
+
+### Recording setup
+
+On Windows, enable the OBS WebSocket server and enter its password in Nahrávání. “Nastavit OBS…” creates and activates a separate **Clipper Capture** profile and scene, configures the replay buffer and creates screen/game and audio sources. It refuses to switch profiles while an OBS output is active. Display capture or fullscreen game capture, two standard sources and up to three extra audio devices are supported. Existing device selections are preserved when refreshing the lists. OBS startup, application startup, password storage and global hotkeys are opt-in.
+
+On Linux, select GPU Screen Recorder or OBS Studio. GSR offers independent recording tracks plus the compatibility mix. “Aktualizovat dostupná zařízení” refreshes PulseAudio/PipeWire devices asynchronously. Changes to recording settings are saved immediately; changing settings while recording offers a buffer restart. GPU Screen Recorder must be compatible with the system libraries and graphics driver.
+
+Linux global shortcuts can use the desktop **Global Shortcuts portal** with custom triggers, or the optional **evdev** fallback where the portal is unavailable. The portal creates a per-user desktop identity; support depends on the desktop environment. evdev may require read permission for `/dev/input/event*`.
+
+Saved replays are confirmed by the recorder/OBS event, named after the active window where supported, and then imported with their audio metadata. Additional quick OBS saves are serialized in a short queue instead of being silently rejected. Because OBS processes them after the current save, the queue is not presented as a guarantee that it captured the exact earlier keypress moment. Clipper waits for pending saves during shutdown, with an explicit timeout warning if the recorder does not finish.
+
+## Media behavior
+
+Trim copies the video stream without re-encoding. For a selection starting after zero, use MP4 or MOV: Matroska cannot reliably hide the earlier reference frames required for decoding. Audio tracks with changed levels are re-encoded; compatible unchanged tracks are copied. Incompatible audio (for example Vorbis in MKV exported to MP4) is converted only where required. MP4/MOV presentation metadata limits the selected endpoint.
+
+Export uses two-pass H.264, mixes chosen audio tracks and verifies the actual file against the requested decimal-MB limit. It can reduce resolution for small targets and remembers the last requested size. Processing is cancellable and temporary files are cleaned up.
+
+Qt can play H.264 directly; otherwise a cached preview or a short hovering proxy is generated. AV1 editor previews have a nominal 2 GB cache limit. Stalled preview/audio preparation has a watchdog and a retry action. Independent tracks play together with their levels; enable “První stopa je mix ostatních stop” for legacy pre-mixed captures to avoid hearing doubled audio. Master or track amplification above 1× uses a temporary mixed-audio render.
 
 ## Build and test
 
@@ -29,16 +57,10 @@ When a replay is saved in the selected clips folder, Clipper names it after the 
 python -m unittest discover -s tests -v
 ```
 
-`scripts/build-windows.ps1` builds a Windows directory using PyInstaller and bundles the FFmpeg executables found on PATH. The GitHub Actions workflow is configured to run tests on Windows and Linux, build both packages, check the wheel's icons and open and close each packaged main window; it has not been executed in this workspace. On Linux, `scripts/build-linux.sh` creates `dist/Linux/Clipper`, which uses FFmpeg from PATH and requires OBS or GPU Screen Recorder separately; the whole output directory must be kept together. The Linux package passed its dependency and main-window smoke tests locally. A Windows directory build is available at `dist/Clipper`; its packaged dependency and main-window smoke tests and selected video playback tests passed under Wine. This does not validate real Windows hardware, audio or OBS capture. Copy the whole directory, including `_internal`, to run it.
+Tests include real FFmpeg operations, multitrack playback, media timing, codec/container compatibility, cancellation, metadata migration, recorder lifecycle, preview cleanup, OBS transport and interface behavior. `QT_QPA_PLATFORM=offscreen` can be used on a headless machine.
 
-## Media behavior
-
-Trim copies the video stream without re-encoding. For a selection starting after zero, use MP4 or MOV: Matroska cannot reliably hide the earlier reference frames required for decoding. For MP4/MOV, the presentation edit list limits the selected endpoint while retaining reordered reference packets for decoding. Audio packet boundaries can still produce small timing differences; other containers may extend past the selected end. Audio tracks with changed volume are re-encoded, while unmodified tracks are copied. Export uses two-pass H.264, mixes the chosen audio tracks and verifies the file against the requested decimal-MB limit. It can reduce resolution to fit small targets. Output is written to a temporary file first so a failed or cancelled operation leaves the destination intact. The processing button can cancel a running trim or export.
-
-For AV1 files, Qt's distributed decoder may not provide software AV1 decoding. The editor therefore generates a seekable H.264 preview in the app's cache, with a nominal 2 GB limit; the source file is still used for trims and exports. The first preview can take time to generate. Preview plays independent audio tracks together and applies their individual levels. For older files with a pre-mixed first track, select the mix option to avoid hearing it twice; imported legacy edits and new captures made with the dedicated Clipper profile remember this automatically. Other files are treated as independent tracks unless the first track is explicitly named Mix. Linux GPU Screen Recorder saves the configured audio source names and mix status with each replay, even when recording settings change before the library processes the notification. For amplification above 1×, a temporary mixed-audio preview is rendered in the background; the editor reports preparation while preview volume remains limited to 1×. Rendering can take time for long clips and uses temporary disk space.
-
-OBS saves are confirmed by the `ReplayBufferSaved` event. While a save is being confirmed, Clipper currently rejects another recording command and reports that it was not performed; it does not queue a delayed replay as though it captured the original keypress. After confirmation, naming and optional metadata lookup run separately, so they do not delay the next request. Rapid consecutive saves before OBS confirms the first remain a limitation to resolve.
+`scripts/build-windows.ps1` builds a Windows directory using PyInstaller and bundles FFmpeg executables found on PATH. On Linux, `scripts/build-linux.sh` creates `dist/Linux/Clipper`; its FFmpeg comes from PATH and OBS or GPU Screen Recorder remains a separate dependency. Keep the whole output directory together. Packaged dependency and main-window self-tests are available through `--self-test` and `--self-test-ui` and are also run by CI.
 
 ## Remaining verification
 
-An isolated OBS 32.1 test saved a replay with a compatibility mix and three independently routed audio tracks. Three synthetic tones were used to verify that the mix contained all sources and each individual track contained only its own tone. The Windows capture inputs were substituted with Linux test sources, so this verifies OBS routing, not WASAPI device capture. The headless test OBS process crashed during signal-driven shutdown; that shutdown path has not been validated. On one Wayland/Intel machine, GPU Screen Recorder 5.13.4 saved an actual 4K replay with three audio streams; its trim, compressed export and editor playback were also checked. That test used temporary compatible FFmpeg libraries because the installed recorder was linked against unavailable libraries, so it does not prove the installed package works without repair. Tests also cover audio-track adjustment, metadata migration, thumbnails and AV1 preview. Windows capture and desktop integration, long-running operation, and other drivers still need end-to-end verification. Do not rely on a development build for irreplaceable footage.
+Real Windows capture/WASAPI devices, native Windows global shortcuts, OBS hook behavior on games and every Linux compositor/driver combination cannot be exhaustively verified by unit tests. The local suite and packaged smoke tests do not replace an end-to-end test on the target hardware. Before relying on Clipper for irreplaceable footage, save a test replay and verify its video, audio tracks and playback on the intended machine.

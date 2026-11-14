@@ -22,6 +22,12 @@ def run_selftest(report_path):
         player.setVideoSink(None)
         checks['qt_multimedia'] = True
         checks['websocket_and_editor_import'] = True
+        if sys.platform == 'linux' and getattr(sys, 'frozen', False):
+            import evdev  # noqa: F401
+            import dbus_next  # noqa: F401
+            from .evdev_hotkeys import EvdevHotkeys  # noqa: F401
+            from .portal_hotkeys import PortalHotkeys  # noqa: F401
+            checks['linux_hotkey_backends'] = True
         for name in ('ffmpeg', 'ffprobe'):
             path = executable(name)
             if sys.platform == 'win32' and getattr(sys, 'frozen', False):

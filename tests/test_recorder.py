@@ -2,7 +2,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from clipper.recorder import CaptureSettings, GSRRecorder, RecorderError
+from clipper.recorder import CaptureSettings, GSRRecorder, RecorderError, RecordingAudioTrack, SavedReplay
 
 class ReplayNamingTests(unittest.TestCase):
     def test_title_lookup_failure_does_not_lose_saved_replay(self):
@@ -84,6 +84,29 @@ class RecorderTests(unittest.TestCase):
             self.assertEqual([s.command()[i+1] for i, v in enumerate(s.command()) if v == '-a'], ['desktop|microphone', 'desktop', 'microphone'])
             s.resolution = 'bad'
             with self.assertRaises(RecorderError): s.command()
+
+    def test_named_tracks_keep_order_gain_and_mix_arguments(self):
+        with tempfile.TemporaryDirectory() as d:
+            tracks = [RecordingAudioTrack('desktop', 'Hra', .65), RecordingAudioTrack('mic', 'Mikrofon', 1.5)]
+            settings = CaptureSettings(d, 'DP-1', audio_devices=['ignored'], audio_tracks=tracks)
+            command = settings.command()
+            self.assertEqual([command[i + 1] for i, value in enumerate(command) if value == '-a'],
+                             ['desktop|mic', 'desktop', 'mic'])
+            self.assertEqual(tracks, [RecordingAudioTrack('desktop', 'Hra', .65), RecordingAudioTrack('mic', 'Mikrofon', 1.5)])
+
+    def test_audio_gain_is_limited_to_150_percent(self):
+        with tempfile.TemporaryDirectory() as d:
+            for gain in (-.01, 1.51, 'invalid'):
+                settings = CaptureSettings(d, 'DP-1', audio_tracks=[RecordingAudioTrack('desktop', gain=gain)])
+                with self.assertRaises(RecorderError): settings.command()
+            settings = CaptureSettings(d, 'DP-1', audio_tracks=[RecordingAudioTrack('desktop', gain=0)])
+            self.assertTrue(settings.command())
+
+    def test_legacy_saved_replay_constructor_has_unity_gains(self):
+        saved = SavedReplay('clip.mkv', True, ('Mix', 'Desktop', 'Mic'))
+        self.assertEqual(saved.track_volumes, {})
+        self.assertEqual(saved.track_gains, (1.0, 1.0, 1.0))
+
     @unittest.skipUnless(sys.platform == 'linux', 'Linux only')
     def test_real_process_failure_contains_diagnostics(self):
         with tempfile.TemporaryDirectory() as d:
@@ -104,13 +127,16 @@ class SavedReplayTests(unittest.TestCase):
             script.chmod(0o755); recorder = GSRRecorder(str(script))
             try:
                 with patch('clipper.recorder.active_window_name', return_value='Game'):
-                    recorder.start(CaptureSettings(d, 'display', audio_devices=['desktop', 'mic']))
+                    recorder.start(CaptureSettings(d, 'display', audio_tracks=[
+                        RecordingAudioTrack('desktop', 'Hra', .7), RecordingAudioTrack('mic', 'Mikrofon', 1.25)]))
                     recorder.save(); deadline = time.monotonic() + 3
                     while recorder.saved.empty() and time.monotonic() < deadline: time.sleep(.02)
                     event = recorder.saved.get_nowait()
                 self.assertEqual(Path(event.path).name, 'Game_1.mkv')
                 self.assertEqual(Path(event.path).read_bytes(), b'clip')
-                self.assertEqual(event.track_names, ('Mix', 'desktop', 'mic'))
+                self.assertEqual(event.track_names, ('Mix', 'Hra', 'Mikrofon'))
+                self.assertEqual(event.track_volumes, {1: 1.0, 2: .7, 3: 1.25})
+                self.assertEqual(event.track_gains, (1.0, .7, 1.25))
             finally: recorder.stop()
 
     @unittest.skipUnless(sys.platform == 'linux', 'Linux only')
@@ -145,7 +171,11 @@ class AudioSourcesTests(unittest.TestCase):
         from unittest.mock import patch
         from clipper.recorder import audio_sources
         with patch('clipper.recorder.subprocess.run', return_value=SimpleNamespace(stdout='1\tdevice.monitor\tmodule\n2\tmicrophone\tmodule\n')):
-            self.assertEqual(audio_sources(), ['device.monitor', 'microphone'])
+            self.assertEqual(audio_sources(), ['default_output', 'default_input', 'device.monitor', 'microphone'])
+
+    def test_safe_default_output_needs_no_running_audio_server(self):
+        from clipper.recorder import default_audio_output
+        self.assertEqual(default_audio_output(), 'default_output')
 
 class RecorderLifecycleTests(unittest.TestCase):
     @unittest.skipUnless(sys.platform == 'linux', 'Linux only')

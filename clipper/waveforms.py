@@ -14,7 +14,7 @@ class Waveforms(QObject):
         super().__init__(parent); self.source=Path(source); self.cache=Path(cache); self.cache.mkdir(parents=True, exist_ok=True)
         self.queue=deque(); self.active={}; self.closing=False
     def request(self, stream_index):
-        st=self.source.stat(); key=hashlib.sha256(f'{self.source.resolve()}:{st.st_mtime_ns}:{st.st_size}:{stream_index}:v2'.encode()).hexdigest()
+        st=self.source.stat(); key=hashlib.sha256(f'{self.source.resolve()}:{st.st_mtime_ns}:{st.st_size}:{stream_index}:v3'.encode()).hexdigest()
         output=self.cache/(key+'.png')
         if output.is_file() and output.stat().st_size: self.ready.emit(stream_index, str(output)); return
         self.queue.append((stream_index,output)); self._schedule()
@@ -25,7 +25,7 @@ class Waveforms(QObject):
             timer=QTimer(process); timer.setSingleShot(True); timer.timeout.connect(process.kill); timer.start(120000)
             process.finished.connect(lambda code,status,p=process: self._finished(p,code))
             process.errorOccurred.connect(lambda error,p=process: self._failed_start(p,error))
-            process.start(executable('ffmpeg'), ['-nostdin','-v','error','-y','-i',str(self.source),'-filter_complex',f'[0:{index}]aformat=channel_layouts=mono,showwavespic=s=1000x64:colors=0xff8c42:filter=peak:scale=sqrt:draw=full[v]','-map','[v]','-frames:v','1',str(tmp)])
+            process.start(executable('ffmpeg'), ['-nostdin','-v','error','-y','-i',str(self.source),'-filter_complex',f'[0:{index}]aformat=channel_layouts=mono,showwavespic=s=1000x64:colors=0x28a745:filter=peak:scale=sqrt:draw=full[v]','-map','[v]','-frames:v','1',str(tmp)])
     def _failed_start(self, process, error):
         if error==QProcess.ProcessError.FailedToStart: self._finished(process,-1)
     def _finished(self, process, code):

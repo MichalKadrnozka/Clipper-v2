@@ -131,6 +131,16 @@ class AudioMixIdentificationTests(unittest.TestCase):
         streams[0]['tags']['title'] = 'Mix'
         self.assertTrue(first_track_is_named_mix({'streams': streams}))
 
+class ContainerCompatibilityTests(unittest.TestCase):
+    def test_incompatible_mkv_audio_is_transcoded_for_mp4(self):
+        with tempfile.TemporaryDirectory() as d:
+            source, destination = Path(d)/'vorbis.mkv', Path(d)/'trim.mp4'
+            run(['ffmpeg', '-v', 'error', '-f', 'lavfi', '-i', 'testsrc2=size=80x60:rate=10',
+                 '-f', 'lavfi', '-i', 'sine=frequency=440', '-t', '2', '-c:v', 'libx264', '-c:a', 'libvorbis', str(source)])
+            trim(source, destination, 0, 1.5)
+            audio = next(stream for stream in probe(destination)['streams'] if stream['codec_type'] == 'audio')
+            self.assertEqual(audio['codec_name'], 'aac')
+
 class MediaProgressTests(unittest.TestCase):
     def test_trim_and_export_report_completion_after_output_exists(self):
         with tempfile.TemporaryDirectory() as d:

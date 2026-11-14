@@ -61,10 +61,16 @@ class GalleryPreview(QObject):
         self.view.horizontalScrollBar().valueChanged.connect(lambda _: self.stop())
 
     def eventFilter(self, watched, event):
-        if watched is self.viewport and not sip.isdeleted(self.view):
+        # Qt can deliver a queued viewport event while the Python wrapper is
+        # already being collected. Never touch partially destroyed attributes.
+        viewport = getattr(self, 'viewport', None)
+        view = getattr(self, 'view', None)
+        if viewport is None or view is None or sip.isdeleted(view) or sip.isdeleted(viewport):
+            return False
+        if watched is viewport:
             kind = event.type()
             if kind == QEvent.Type.MouseMove:
-                index = self.view.indexAt(event.position().toPoint())
+                index = view.indexAt(event.position().toPoint())
                 value = index.data(Qt.ItemDataRole.UserRole) if index.isValid() else None
                 path = str(value) if value else None
                 if path != self.path:

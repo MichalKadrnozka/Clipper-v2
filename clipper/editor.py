@@ -7,11 +7,11 @@ from PyQt6 import sip
 # Unreliable hardware backends can fail indefinitely for an unsupported codec.
 # Prefer software decoding; an explicit environment override remains available.
 os.environ.setdefault("QT_FFMPEG_DECODING_HW_DEVICE_TYPES", ",")
-from PyQt6.QtCore import Qt, QTimer, QUrl, QRectF, QRect, QSize, pyqtSignal
+from PyQt6.QtCore import Qt, QTimer, QUrl, QRectF, QRect, QSize, QPointF, pyqtSignal
 from PyQt6.QtWidgets import (QDialog, QDoubleSpinBox, QFormLayout, QHBoxLayout, QLabel,
     QPushButton, QSlider, QVBoxLayout, QWidget, QCheckBox, QScrollArea, QStyle, QStyleOptionSlider, QGroupBox, QSplitter, QFrame)
 from PyQt6.QtMultimedia import QAudioOutput, QMediaPlayer, QVideoSink
-from PyQt6.QtGui import QPainter, QColor, QPixmap, QPen, QIcon
+from PyQt6.QtGui import QPainter, QColor, QPixmap, QPen, QIcon, QPolygonF
 from .media import duration, probe, first_track_is_named_mix
 from .proxy import PreviewProxy
 from .waveforms import Waveforms
@@ -20,6 +20,7 @@ from .audio_preview import AudioPreview
 class VideoSurface(QWidget):
     """Paint video frames inside Qt, including on Wayland and offscreen backends."""
     frameChanged = pyqtSignal(object)
+    clicked = pyqtSignal()
     def __init__(self, parent=None):
         super().__init__(parent)
         self.sink = QVideoSink(self); self.image = None; self.poster = None
@@ -32,6 +33,14 @@ class VideoSurface(QWidget):
         if frame.isValid():
             image = frame.toImage()
             if not image.isNull(): self.image = image; self.frameChanged.emit(image); self.update()
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            event.accept(); return
+        super().mousePressEvent(event)
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit(); event.accept(); return
+        super().mouseReleaseEvent(event)
     def paintEvent(self, event):
         painter = QPainter(self); painter.fillRect(self.rect(), QColor('#080a0f'))
         image = self.image or self.poster
@@ -62,29 +71,37 @@ class WaveformView(QWidget):
     endRequested = pyqtSignal(float)
     def __init__(self, parent=None):
         super().__init__(parent); self.picture = QPixmap(); self.start = 0.; self.end = 1.; self.position = 0.
-        self.dragging = None
+        self.dragging = None; self.trim_enabled = True
         self.setMinimumWidth(200); self.setFixedHeight(48); self.setCursor(Qt.CursorShape.PointingHandCursor)
     def set_image(self, path): self.picture.load(path); self.update()
+    def set_trim_enabled(self, enabled):
+        self.trim_enabled = bool(enabled)
+        if not self.trim_enabled: self.dragging = None
+        self.update()
     def paintEvent(self, event):
         painter = QPainter(self); painter.fillRect(self.rect(), QColor('#171717'))
         if not self.picture.isNull(): painter.drawPixmap(self.rect(), self.picture)
-        painter.fillRect(QRectF(0,0,self.width()*self.start,self.height()), QColor(8,10,15,160))
-        painter.fillRect(QRectF(self.width()*self.end,0,self.width()*(1-self.end),self.height()), QColor(8,10,15,160))
-        painter.setPen(QPen(QColor('#ffb270'),2))
-        for value in (self.start,self.end): painter.drawLine(int(self.width()*value),0,int(self.width()*value),self.height())
+        if self.trim_enabled:
+            painter.fillRect(QRectF(0,0,self.width()*self.start,self.height()), QColor(0,0,0,175))
+            painter.fillRect(QRectF(self.width()*self.end,0,self.width()*(1-self.end),self.height()), QColor(0,0,0,175))
+            painter.setPen(QPen(QColor('#ff7300'),3))
+            for value in (self.start,self.end):
+                x = int(self.width()*value); direction = 1 if value == self.start else -1
+                painter.drawLine(x,0,x,self.height())
+                painter.drawLine(x,0,x + 7*direction,0); painter.drawLine(x,self.height()-1,x + 7*direction,self.height()-1)
         painter.setPen(QPen(QColor('#ffffff'),1)); x=int(self.width()*self.position); painter.drawLine(x,0,x,self.height())
     def mousePressEvent(self, event):
         if event.button() != Qt.MouseButton.LeftButton: return
         x = event.position().x()
         start_distance = abs(x - self.width() * self.start)
         end_distance = abs(x - self.width() * self.end)
-        if min(start_distance, end_distance) <= 8:
+        if self.trim_enabled and min(start_distance, end_distance) <= 8:
             self.dragging = 'start' if start_distance <= end_distance else 'end'
         else:
             self.seekRequested.emit(max(0., min(1., x / max(1, self.width()))))
         event.accept()
     def mouseMoveEvent(self, event):
-        if not self.dragging: return
+        if not self.trim_enabled or not self.dragging: return
         fraction = max(0., min(1., event.position().x() / max(1, self.width())))
         if self.dragging == 'start': self.startRequested.emit(min(fraction, self.end))
         else: self.endRequested.emit(max(fraction, self.start))
@@ -99,10 +116,14 @@ class VideoTimelineStrip(QWidget):
     endRequested = pyqtSignal(float)
     def __init__(self, duration, parent=None):
         super().__init__(parent); self.length=max(float(duration), .001); self.image=None
-        self.start=0.; self.end=1.; self.position=0.; self.dragging=None
+        self.start=0.; self.end=1.; self.position=0.; self.dragging=None; self.trim_enabled=True
         self.setMinimumHeight(76); self.setMaximumHeight(92); self.setMinimumWidth(280)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
     def set_image(self, image): self.image=image; self.update()
+    def set_trim_enabled(self, enabled):
+        self.trim_enabled=bool(enabled)
+        if not self.trim_enabled:self.dragging=None
+        self.update()
     def set_range(self, start, end, position):
         self.start=max(0.,min(1.,start)); self.end=max(self.start,min(1.,end)); self.position=max(0.,min(1.,position)); self.update()
     def paintEvent(self, event):
@@ -111,8 +132,9 @@ class VideoTimelineStrip(QWidget):
         painter.fillRect(rect,QColor('#27528f'))
         painter.setPen(QColor(255,255,255,125))
         painter.drawText(QRectF(rect.left()+10,rect.top(),90,rect.height()),Qt.AlignmentFlag.AlignVCenter|Qt.AlignmentFlag.AlignLeft,'VIDEO')
-        painter.fillRect(QRectF(rect.left(),rect.top(),rect.width()*self.start,rect.height()),QColor(0,0,0,175))
-        painter.fillRect(QRectF(rect.left()+rect.width()*self.end,rect.top(),rect.width()*(1-self.end),rect.height()),QColor(0,0,0,175))
+        if self.trim_enabled:
+            painter.fillRect(QRectF(rect.left(),rect.top(),rect.width()*self.start,rect.height()),QColor(0,0,0,175))
+            painter.fillRect(QRectF(rect.left()+rect.width()*self.end,rect.top(),rect.width()*(1-self.end),rect.height()),QColor(0,0,0,175))
         interval=max(1.,self.length/8); power=10**int(__import__('math').log10(interval)); interval=min((1,2,5,10),key=lambda n:abs(n*power-interval))*power
         painter.setPen(QColor('#b7b7b7')); tick=0.
         while tick<=self.length:
@@ -121,19 +143,22 @@ class VideoTimelineStrip(QWidget):
             label=f'{int(tick)//60}:{int(tick)%60:02d}'
             painter.drawText(QRectF(x+3,0,48,17),Qt.AlignmentFlag.AlignLeft|Qt.AlignmentFlag.AlignVCenter,label)
             tick+=interval
-        painter.setPen(QPen(QColor('#ff7300'),2))
-        for value in (self.start,self.end):
-            x=int(rect.left()+rect.width()*value); painter.drawLine(x,rect.top(),x,rect.bottom())
-        x=int(rect.left()+rect.width()*self.position); painter.setPen(QPen(QColor('#ffffff'),2)); painter.drawLine(x,rect.top(),x,rect.bottom())
+        if self.trim_enabled:
+            painter.setPen(QPen(QColor('#ff7300'),2))
+            for value in (self.start,self.end):
+                x=int(rect.left()+rect.width()*value); painter.drawLine(x,rect.top(),x,rect.bottom())
+        x=int(rect.left()+rect.width()*self.position); painter.setPen(QPen(QColor('#ffffff'),2)); painter.drawLine(x,0,x,rect.bottom())
+        painter.setPen(Qt.PenStyle.NoPen); painter.setBrush(QColor('#ffffff'))
+        painter.drawPolygon(QPolygonF([QPointF(x-5, rect.top()), QPointF(x+5, rect.top()), QPointF(x, rect.top()+7)]))
     def mousePressEvent(self,event):
         if event.button()!=Qt.MouseButton.LeftButton:return
         rect=self.rect().adjusted(0,19,0,-2); x=event.position().x(); start=rect.left()+rect.width()*self.start; end=rect.left()+rect.width()*self.end
-        if abs(x-start)<=9:self.dragging='start'
-        elif abs(x-end)<=9:self.dragging='end'
+        if self.trim_enabled and abs(x-start)<=9:self.dragging='start'
+        elif self.trim_enabled and abs(x-end)<=9:self.dragging='end'
         else:self.seekRequested.emit(max(0.,min(1.,(x-rect.left())/max(1,rect.width()))))
         event.accept()
     def mouseMoveEvent(self,event):
-        if not self.dragging:return
+        if not self.trim_enabled or not self.dragging:return
         rect=self.rect().adjusted(0,19,0,-2); fraction=max(0.,min(1.,(event.position().x()-rect.left())/max(1,rect.width())))
         if self.dragging=='start':self.startRequested.emit(min(fraction,self.end))
         else:self.endRequested.emit(max(fraction,self.start))
@@ -142,9 +167,10 @@ class VideoTimelineStrip(QWidget):
         if event.button()==Qt.MouseButton.LeftButton:self.dragging=None;event.accept()
 
 class Editor(QDialog):
-    def __init__(self, path, parent=None, info=None):
+    def __init__(self, path, parent=None, info=None, preview_mode=False):
         super().__init__(parent)
         self.owner = parent
+        self.preview_mode = bool(preview_mode)
         self.setWindowFlags(Qt.WindowType.Widget)
         self.path = Path(path)
         self.info = info if info is not None else probe(path)
@@ -167,6 +193,7 @@ class Editor(QDialog):
         video_layout = QVBoxLayout(video_panel); video_layout.setContentsMargins(0, 0, 0, 2); video_layout.setSpacing(5)
         self.player = QMediaPlayer(self)
         self.video = VideoSurface(); self.video.setMinimumSize(160, 90); self.video.setStyleSheet('background:#050505;')
+        self.video.clicked.connect(self.toggle)
         self.player.setVideoSink(self.video.videoSink()); video_layout.addWidget(self.video, 1)
         self._thumbnail_service = getattr(parent, 'thumbnails', None)
         self._thumbnail_slot = None
@@ -184,15 +211,15 @@ class Editor(QDialog):
         self.range_summary = QLabel('Celý klip'); self.range_summary.setStyleSheet('color:#ff7300;font-weight:600;'); time_row.addWidget(self.range_summary)
         self.seek = SeekSlider(Qt.Orientation.Horizontal); self.seek.setRange(0, int(self.length * 1000)); video_layout.addWidget(self.seek)
         self.seek.sliderMoved.connect(self.player.setPosition)
-        range_box = QGroupBox('Rozsah střihu'); range_layout = QHBoxLayout(range_box); range_layout.setContentsMargins(8, 3, 8, 3); range_layout.setSpacing(7)
+        self.range_box = QGroupBox('Rozsah střihu'); range_layout = QHBoxLayout(self.range_box); range_layout.setContentsMargins(8, 3, 8, 3); range_layout.setSpacing(7)
         self.start = QDoubleSpinBox(); self.end = QDoubleSpinBox()
         for value in (self.start, self.end): value.setRange(0, self.length); value.setDecimals(2); value.setSuffix(' s'); value.setFixedWidth(112); value.setMinimumHeight(30)
         self.end.setValue(self.length); self.start.setToolTip('Přesný čas začátku.'); self.end.setToolTip('Přesný čas konce.')
         range_layout.addWidget(QLabel('IN')); range_layout.addWidget(self.start)
-        mark_start = QPushButton(); mark_start.setIcon(QIcon(str(Path(__file__).parent / 'assets/icons/trim_start.png'))); mark_start.setFixedSize(34,30); mark_start.setToolTip('Nastavit začátek na aktuální pozici.'); mark_start.clicked.connect(self.mark_start); range_layout.addWidget(mark_start)
+        self.mark_start_button = QPushButton(); self.mark_start_button.setIcon(QIcon(str(Path(__file__).parent / 'assets/icons/trim_start.png'))); self.mark_start_button.setFixedSize(34,30); self.mark_start_button.setToolTip('Nastavit začátek na aktuální pozici (I).'); self.mark_start_button.clicked.connect(self.mark_start); range_layout.addWidget(self.mark_start_button)
         range_layout.addSpacing(12); range_layout.addWidget(QLabel('OUT')); range_layout.addWidget(self.end)
-        mark_end = QPushButton(); mark_end.setIcon(QIcon(str(Path(__file__).parent / 'assets/icons/trim_end.png'))); mark_end.setFixedSize(34,30); mark_end.setToolTip('Nastavit konec na aktuální pozici.'); mark_end.clicked.connect(self.mark_end); range_layout.addWidget(mark_end); range_layout.addStretch(1)
-        video_layout.addWidget(range_box)
+        self.mark_end_button = QPushButton(); self.mark_end_button.setIcon(QIcon(str(Path(__file__).parent / 'assets/icons/trim_end.png'))); self.mark_end_button.setFixedSize(34,30); self.mark_end_button.setToolTip('Nastavit konec na aktuální pozici (O).'); self.mark_end_button.clicked.connect(self.mark_end); range_layout.addWidget(self.mark_end_button); range_layout.addStretch(1)
+        video_layout.addWidget(self.range_box)
         controls = QHBoxLayout(); video_layout.addLayout(controls)
         def tool_button(icon, tooltip, handler):
             button=QPushButton(); button.setIcon(QIcon(str(Path(__file__).parent / 'assets/icons' / icon))); button.setIconSize(QSize(20,20)); button.setFixedSize(38,34); button.setToolTip(tooltip); button.clicked.connect(handler); controls.addWidget(button); return button
@@ -205,10 +232,14 @@ class Editor(QDialog):
         controls.addSpacing(10)
         self.speed=QPushButton('1×'); self.speed.setFixedHeight(34); self.speed.setToolTip('Rychlost přehrávání'); self.speed.clicked.connect(self.change_speed); controls.addWidget(self.speed)
         self.mute=QPushButton(); self.mute.setIcon(QIcon(str(Path(__file__).parent / 'assets/icons/icons8-volume-96.png'))); self.mute.setIconSize(QSize(20,20)); self.mute.setFixedSize(38,34); self.mute.setCheckable(True); self.mute.setToolTip('Ztlumit zvuk'); controls.addWidget(self.mute)
-        self.listen_volume=QSlider(Qt.Orientation.Horizontal); self.listen_volume.setRange(0,100); self.listen_volume.setValue(100); self.listen_volume.setFixedWidth(100); controls.addWidget(self.listen_volume)
+        self.listen_volume=QSlider(Qt.Orientation.Horizontal); self.listen_volume.setRange(0,150); self.listen_volume.setFixedWidth(100); self.listen_volume.setToolTip('Hlasitost náhledu (0–150 %)')
+        try: master_volume = float(parent.library.setting('master_volume', 100)) if parent and hasattr(parent, 'library') else 100
+        except (TypeError, ValueError): master_volume = 100
+        self.listen_volume.setValue(round(max(0, min(150, master_volume)))); controls.addWidget(self.listen_volume)
         controls.addStretch(1)
-        save_trim=QPushButton('Uložit střih'); save_trim.setIcon(QIcon(str(Path(__file__).parent / 'assets/icons/icons8-trim-96.png'))); save_trim.setProperty('primary',True); save_trim.clicked.connect(lambda:self.accept_operation('trim')); controls.addWidget(save_trim)
-        export_button=QPushButton('Export…'); export_button.setIcon(QIcon(str(Path(__file__).parent / 'assets/icons/icons8-export-96.png'))); export_button.clicked.connect(lambda:self.accept_operation('export')); controls.addWidget(export_button)
+        self.save_trim=QPushButton('Uložit střih'); self.save_trim.setIcon(QIcon(str(Path(__file__).parent / 'assets/icons/icons8-trim-96.png'))); self.save_trim.setProperty('primary',True); self.save_trim.clicked.connect(lambda:self.accept_operation('trim')); controls.addWidget(self.save_trim)
+        self.save_trim_button = self.save_trim
+        self.export_button=QPushButton('Export…'); self.export_button.setIcon(QIcon(str(Path(__file__).parent / 'assets/icons/icons8-export-96.png'))); self.export_button.clicked.connect(lambda:self.accept_operation('export')); controls.addWidget(self.export_button)
         self.volumes = {}; self.wave_labels = {}
         saved = parent.library.edit_for(self.path) if parent and hasattr(parent, 'library') else {}
         self.track_names = saved.get('track_names', [])
@@ -256,6 +287,7 @@ class Editor(QDialog):
             for index, slider in self.volumes.items():
                 slider.valueChanged.connect(lambda value, i=index: self.audio_preview.set_gain(i, value))
             self.audio_preview.status.connect(self.audio_status.setText)
+            self.audio_preview.set_master(self.listen_volume.value() / 100)
         else:
             self.mute.setEnabled(False)
             self.listen_volume.setEnabled(False)
@@ -263,7 +295,9 @@ class Editor(QDialog):
         workspace.addWidget(video_panel); workspace.addWidget(track_group)
         workspace.setStretchFactor(0, 7); workspace.setStretchFactor(1, 2); workspace.setSizes([610, 180])
         footer = QHBoxLayout(); layout.addLayout(footer)
-        keyboard_hint = QLabel('Mezerník: přehrát / pauza  ·  ← / →: snímek'); keyboard_hint.setStyleSheet('color:#888888;'); footer.addWidget(keyboard_hint); footer.addStretch(1)
+        hint = 'Mezerník / klik na video: přehrát / pauza  ·  ← / →: snímek'
+        if not self.preview_mode: hint += '  ·  I / O: IN / OUT'
+        self.keyboard_hint = QLabel(hint); self.keyboard_hint.setStyleSheet('color:#888888;'); footer.addWidget(self.keyboard_hint); footer.addStretch(1)
         if parent and hasattr(parent, 'library'):
             try:
                 self.start.setValue(float(saved.get('in', 0)) * self.length)
@@ -271,6 +305,15 @@ class Editor(QDialog):
                 for index, slider in self.volumes.items(): slider.setValue(float(saved.get('volumes', {}).get(str(index), 1)))
                 if 'mix_first' in saved: self.first_is_mix.setChecked(bool(saved['mix_first']))
             except (TypeError, ValueError): pass
+        if self.preview_mode:
+            self.range_box.hide(); self.range_box.setEnabled(False); self.range_summary.hide()
+            for widget in (self.start, self.end, self.mark_start_button, self.mark_end_button,
+                           self.save_trim, self.export_button):
+                widget.setEnabled(False)
+            self.save_trim.hide(); self.export_button.hide()
+            self.video_timeline.set_trim_enabled(False)
+            for wave in self.wave_labels.values():
+                wave.set_trim_enabled(False); wave.setToolTip('Kliknutím přeskočíš na místo.')
         self.start.valueChanged.connect(self.update_waveforms); self.end.valueChanged.connect(self.update_waveforms)
         self.player.positionChanged.connect(self.position_changed)
         self.player.playbackStateChanged.connect(lambda *_: self.update_play_state())
@@ -300,8 +343,6 @@ class Editor(QDialog):
         pixmap = QPixmap(image_path)
         if pixmap.isNull(): return
         self.video.set_poster(pixmap)
-    def showEvent(self, event):
-        super().showEvent(event)
     def preview_failed(self, error):
         if self.closing: return
         self.time.setText('Náhled se nepodařilo připravit: ' + error[-300:])
@@ -322,7 +363,10 @@ class Editor(QDialog):
         if self.closing: return
         def stamp(value):
             total = max(0, int(value)); return f'{total//60}:{total%60:02d}'
-        self.range_summary.setText(f'{stamp(self.start.value())} – {stamp(self.end.value())}')
+        invalid = self.start.value() >= self.end.value()
+        self.range_summary.setText('Neplatný rozsah: konec musí být za začátkem' if invalid else f'{stamp(self.start.value())} – {stamp(self.end.value())}')
+        self.range_summary.setStyleSheet('color:#ff5555;font-weight:600;' if invalid else 'color:#ff7300;font-weight:600;')
+        self.save_trim.setEnabled(not invalid and not self.preview_mode); self.export_button.setEnabled(not invalid and not self.preview_mode)
         position=min(1.,max(0.,self.player.position()/(self.length*1000)))
         self.video_timeline.set_range(self.start.value()/self.length,self.end.value()/self.length,position)
         for wave in self.wave_labels.values():
@@ -331,7 +375,6 @@ class Editor(QDialog):
     def update_play_state(self):
         if self.closing: return
         playing = self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState
-        icon = QStyle.StandardPixmap.SP_MediaPause if playing else QStyle.StandardPixmap.SP_MediaPlay
         self.play_button.setIcon(QIcon(str(Path(__file__).parent / 'assets/icons' / ('icons8-pause-96.png' if playing else 'icons8-play-96.png')))); self.play_button.setToolTip('Pauza' if playing else 'Přehrát')
     def waveform_ready(self, index, path):
         wave = self.wave_labels.get(index)
@@ -341,10 +384,17 @@ class Editor(QDialog):
     def preview_ready(self, path):
         self.player.setSource(QUrl.fromLocalFile(path)); self.play_button.setEnabled(True)
         self.time.setText('Náhled připraven')
-        if self._play_requested: self.player.play()
+        if self._play_requested: self._play_from_start()
+    def _play_from_start(self):
+        self.player.setPosition(int(self.start.value() * 1000))
+        self.player.play()
     def keyPressEvent(self, event):
         if event.key() == Qt.Key.Key_Space:
             self.toggle(); event.accept(); return
+        if event.key() in (Qt.Key.Key_I, Qt.Key.Key_O):
+            if not self.preview_mode:
+                self.mark_start() if event.key() == Qt.Key.Key_I else self.mark_end()
+            event.accept(); return
         if event.key() in (Qt.Key.Key_Left, Qt.Key.Key_Right):
             stream = next(s for s in self.info['streams'] if s.get('codec_type') == 'video')
             try: fps = float(Fraction(stream.get('avg_frame_rate', '30/1')))
@@ -372,7 +422,7 @@ class Editor(QDialog):
     def request_autoplay(self):
         if self.closing: return
         self._play_requested = True
-        if self.play_button.isEnabled(): self.player.play()
+        if self.play_button.isEnabled(): self._play_from_start()
     def toggle(self):
         if not self.play_button.isEnabled(): return
         if self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
@@ -388,13 +438,16 @@ class Editor(QDialog):
         except (ValueError, ZeroDivisionError): fps = 30.
         if fps <= 0: fps = 30.
         self.player.setPosition(max(0, min(int(self.length * 1000), self.player.position() + round(count * 1000 / fps))))
-    def mark_start(self): self.start.setValue(self.player.position()/1000)
-    def mark_end(self): self.end.setValue(self.player.position()/1000)
+    def mark_start(self):
+        if not self.preview_mode: self.start.setValue(self.player.position()/1000)
+    def mark_end(self):
+        if not self.preview_mode: self.end.setValue(self.player.position()/1000)
     def change_speed(self):
         rates = [1., 1.5, 2., .5]; current = self.player.playbackRate()
         rate = rates[(rates.index(current)+1) % len(rates)] if current in rates else 1.
         self.player.setPlaybackRate(rate); self.speed.setText(f'{rate:g}×')
     def accept_operation(self, operation):
+        if self.preview_mode and operation in ('trim', 'export'): return
         if self.start.value() >= self.end.value():
             self.time.setText('Konec musí být za začátkem.'); return
         self.operation = operation; self.accept()
@@ -423,6 +476,7 @@ class Editor(QDialog):
         self.waveforms.shutdown()
         parent = self.owner
         if parent and hasattr(parent, 'library'):
+            parent.library.set_setting('master_volume', self.listen_volume.value())
             parent.library.save_edit(self.path, {'in': self.start.value() / self.length, 'out': self.end.value() / self.length,
                 'volumes': {str(i): value.value() for i, value in self.volumes.items()}, 'mix_first': self.first_is_mix.isChecked(),
                 'track_names': self.track_names})

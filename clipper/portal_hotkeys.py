@@ -1,13 +1,62 @@
 """Wayland global shortcuts via xdg-desktop-portal."""
 import asyncio
 import uuid
+from collections.abc import Mapping
 from PyQt6.QtCore import QThread, pyqtSignal
+from .hotkeys import parse_hotkey
 from .linux_identity import APP_ID, ensure_desktop_entry
+
+DEFAULT_BINDINGS = {'save': 'F10', 'toggle': 'F9'}
+DESCRIPTIONS = {
+    'save': 'Uložit klip',
+    'toggle': 'Zapnout nebo vypnout replay buffer',
+}
+PORTAL_MODIFIERS = ((0x0002, 'CTRL'), (0x0001, 'ALT'), (0x0004, 'SHIFT'), (0x0008, 'LOGO'))
+PORTAL_KEYS = {
+    0x1B: 'Escape',
+    0x20: 'space',
+    0x21: 'Prior',
+    0x22: 'Next',
+    0x23: 'End',
+    0x24: 'Home',
+    0x2D: 'Insert',
+    0x2E: 'Delete',
+}
+
+
+def portal_trigger(text):
+    """Translate the UI hotkey syntax to an XDG shortcuts-spec trigger."""
+    modifiers, code = parse_hotkey(text)
+    if code in PORTAL_KEYS:
+        key = PORTAL_KEYS[code]
+    elif 0x70 <= code <= 0x87:
+        key = f'F{code - 0x70 + 1}'
+    elif 0x41 <= code <= 0x5A:
+        key = chr(code).lower()
+    elif 0x30 <= code <= 0x39:
+        key = chr(code)
+    else:
+        raise ValueError(f'Unsupported portal key code: {code}')
+    parts = [name for flag, name in PORTAL_MODIFIERS if modifiers & flag]
+    parts.append(key)
+    return '+'.join(parts)
+
 
 class PortalHotkeys(QThread):
     activated = pyqtSignal(str)
     error = pyqtSignal(str)
     bound = pyqtSignal()
+
+    def __init__(self, bindings=None, parent=None):
+        # Keep the historical PortalHotkeys(parent) call working while also
+        # accepting the same (bindings, parent) convention as WindowsHotkeys.
+        if bindings is not None and not isinstance(bindings, Mapping):
+            if parent is not None:
+                raise TypeError('Specify bindings before parent')
+            parent, bindings = bindings, None
+        super().__init__(parent)
+        self.bindings = dict(DEFAULT_BINDINGS if bindings is None else bindings)
+        self.triggers = {name: portal_trigger(key) for name, key in self.bindings.items()}
 
     def run(self):
         try: asyncio.run(self._run())
@@ -60,15 +109,20 @@ class PortalHotkeys(QThread):
             body = await call(Message(destination='org.freedesktop.portal.Desktop', path='/org/freedesktop/portal/desktop', interface=interface,
                 member='CreateSession', signature='a{sv}', body=[{'handle_token': Variant('s', 'c'+token), 'session_handle_token': Variant('s', 's'+token)}]))
             session = (await response(body[0]))['session_handle'].value
-            shortcuts = [['save', {'description': Variant('s', 'Uložit klip'), 'preferred_trigger': Variant('s', 'F10')}],
-                         ['toggle', {'description': Variant('s', 'Zapnout nebo vypnout replay buffer'), 'preferred_trigger': Variant('s', 'F9')}]]
+            shortcuts = [
+                [name, {
+                    'description': Variant('s', DESCRIPTIONS.get(name, name)),
+                    'preferred_trigger': Variant('s', self.triggers[name]),
+                }]
+                for name in self.bindings
+            ]
             body = await call(Message(destination='org.freedesktop.portal.Desktop', path='/org/freedesktop/portal/desktop', interface=interface,
                 member='BindShortcuts', signature='oa(sa{sv})sa{sv}', body=[session, shortcuts, '', {'handle_token': Variant('s', 'b'+token)}]))
             bound = await response(body[0])
             shortcuts_result = bound.get('shortcuts')
             ids = {item[0] for item in shortcuts_result.value} if shortcuts_result else set()
-            if not {'save', 'toggle'}.issubset(ids):
-                raise RuntimeError('Systém nepřiřadil obě požadované zkratky.')
+            if not set(self.bindings).issubset(ids):
+                raise RuntimeError('Systém nepřiřadil všechny požadované zkratky.')
             self.bound.emit()
             while not self.isInterruptionRequested(): await asyncio.sleep(.2)
             await call(Message(destination='org.freedesktop.portal.Desktop', path=session, interface='org.freedesktop.portal.Session', member='Close'))

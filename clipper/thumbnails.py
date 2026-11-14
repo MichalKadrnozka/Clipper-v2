@@ -80,6 +80,8 @@ class Thumbnails(QObject):
         self._schedule()
     def shutdown(self):
         self.closing = True; self.queue.clear()
-        for process in list(self.active):
-            process.kill(); process.waitForFinished(3000)
-        self.active.clear(); self.pending.clear(); self.failed_until.clear()
+        active = list(self.active.items()); self.active.clear(); self.pending.clear(); self.failed_until.clear()
+        for process, (_, _, _, temporary) in active:
+            try: process.finished.disconnect(); process.errorOccurred.disconnect()
+            except (TypeError, RuntimeError): pass
+            process.kill(); process.waitForFinished(3000); temporary.unlink(missing_ok=True); process.deleteLater()

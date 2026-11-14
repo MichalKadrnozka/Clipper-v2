@@ -16,6 +16,12 @@ from clipper.media import run
 
 
 class GalleryPreviewTests(unittest.TestCase):
+    def test_queued_event_after_cleanup_is_ignored(self):
+        view = QListWidget(); preview = GalleryPreview(view, type('Library', (), {'edit_for': lambda *_: {}})(), view)
+        preview.viewport = None; preview.view = None
+        self.assertFalse(preview.eventFilter(view, QEvent(QEvent.Type.Leave)))
+        view.close()
+
     @classmethod
     def setUpClass(cls):
         cls.app = QApplication.instance() or QApplication([])

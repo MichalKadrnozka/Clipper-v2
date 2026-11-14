@@ -172,7 +172,7 @@ class InterfaceTests(unittest.TestCase):
             def start(self): self.running = True
             def isRunning(self): return self.running
             def finish(self): self.running = False; self.finished.emit()
-        with tempfile.TemporaryDirectory() as d, patch.dict(os.environ, {'APPDATA': d, 'XDG_DATA_HOME': d}):
+        with tempfile.TemporaryDirectory() as d, patch.dict(os.environ, {'APPDATA': d, 'XDG_DATA_HOME': d}), patch('clipper.app.audio_sources', return_value=[]):
             window = Window(); window.tabs.setCurrentIndex(0); window.backend_combo.setCurrentIndex(0); window.show()
             self.application.processEvents()
             with patch('clipper.app.ScreenPreviewJob', FakeScreenJob):
@@ -375,8 +375,8 @@ class InterfaceTests(unittest.TestCase):
         from PyQt6.QtWidgets import QDialog
         events = []
         class FakeEditor(QDialog):
-            def __init__(self, path, parent, info):
-                super().__init__(parent); self.path = path; self.operation = None; self.proxy = None; events.append(('open', path))
+            def __init__(self, path, parent, info, preview_mode=False):
+                super().__init__(parent); self.path = path; self.operation = None; self.proxy = None; self.preview_mode = preview_mode; events.append(('open', path))
             def request_autoplay(self): events.append(('play',))
             def result_values(self): return (0, 1, {}, False)
         with tempfile.TemporaryDirectory() as d, patch.dict(os.environ, {'APPDATA': d, 'XDG_DATA_HOME': d}):
@@ -615,6 +615,61 @@ class InterfaceTests(unittest.TestCase):
                 self.assertEqual(window.status.text(), before)
             window.quitting = True; window.close()
 
+    def test_copy_export_uses_newest_or_explicitly_selected_version(self):
+        from pathlib import Path
+        from PyQt6.QtCore import Qt
+        with tempfile.TemporaryDirectory() as d, patch.dict(os.environ, {'APPDATA': d, 'XDG_DATA_HOME': d}):
+            original = Path(d)/'clip.mp4'; newer = Path(d)/'clip_export.mp4'; older = Path(d)/'older_export.mp4'
+            for path in (original, older, newer): path.touch()
+            os.utime(older, (100, 100)); os.utime(newer, (200, 200))
+            window = Window(); window.library.set_version(older, 'clip', 'export'); window.folder = d; window.refresh(); item = window.list.item(0)
+            item.setSelected(True); window.list.setCurrentItem(item)
+            self.assertEqual(window.selected_export_paths(), [newer])
+            index = window.detail_version.findData(str(older)); window.detail_version.setCurrentIndex(index)
+            self.assertEqual(window.selected_export_paths(), [older])
+            window.quitting = True; window.close()
+
+    def test_unexpected_gsr_exit_restores_recording_controls(self):
+        with tempfile.TemporaryDirectory() as d, patch.dict(os.environ, {'APPDATA': d, 'XDG_DATA_HOME': d}):
+            window = Window(); window.set_gsr_ui_state(True); window.recorder.expect_running = True; window.recorder.process = None
+            window.check_native_recorder()
+            self.assertTrue(window.gsr_start_button.isEnabled())
+            self.assertFalse(window.gsr_save_button.isEnabled())
+            self.assertFalse(window.gsr_stop_button.isEnabled())
+            self.assertIn('neočekávaně', window.gsr_state_label.text())
+            window.quitting = True; window.close()
+
+    def test_scale_is_committed_only_by_restart(self):
+        with tempfile.TemporaryDirectory() as d, patch.dict(os.environ, {'APPDATA': d, 'XDG_DATA_HOME': d}):
+            window = Window(); initial = window.library.setting('ui_scale', '1')
+            window.ui_scale.setValue(150)
+            self.assertEqual(window.library.setting('ui_scale', '1'), initial)
+            self.assertTrue(window.scale_restart.isEnabled())
+            window.quitting = True; window.close()
+
+    def test_queued_obs_save_continues_after_current_operation(self):
+        from unittest.mock import Mock
+        with tempfile.TemporaryDirectory() as d, patch.dict(os.environ, {'APPDATA': d, 'XDG_DATA_HOME': d}):
+            window = Window(); running = Mock(); running.isRunning.return_value = True; window.capture_thread = running
+            self.assertTrue(window.obs_action('save'))
+            self.assertEqual(window.obs_pending_saves, 1)
+            window.capture_thread = None
+            with patch.object(window, 'obs_action') as following:
+                window.continue_obs_saves(); self.application.processEvents()
+                following.assert_called_once_with('save')
+            self.assertEqual(window.obs_pending_saves, 0)
+            if window.thread:
+                from PyQt6.QtCore import QEventLoop, QTimer
+                loop = QEventLoop(); window.thread.finished.connect(loop.quit); QTimer.singleShot(7000, loop.quit); loop.exec()
+            window.quitting = True; window.close()
+
+    def test_restart_launches_after_close_is_accepted(self):
+        with tempfile.TemporaryDirectory() as d, patch.dict(os.environ, {'APPDATA': d, 'XDG_DATA_HOME': d}):
+            window = Window(); window._restart_pending = True; window.quitting = True
+            with patch.object(window, 'launch_replacement') as launch:
+                window.close(); self.application.processEvents()
+                launch.assert_called_once_with()
+
     def test_remember_password_is_saved_when_checkbox_changes(self):
         from PyQt6.QtWidgets import QLineEdit, QCheckBox
         with tempfile.TemporaryDirectory() as d, patch.dict(os.environ, {'APPDATA': d, 'XDG_DATA_HOME': d}):
@@ -748,6 +803,22 @@ class InterfaceTests(unittest.TestCase):
                                   '-f', 's16le', '-acodec', 'pcm_s16le', '-'], capture_output=True, check=True).stdout
             samples = array.array('h'); samples.frombytes(raw)
             self.assertLess(max(abs(value) for value in samples), 10)
+            window.quitting = True; window.close()
+
+    def test_quick_operation_restores_saved_range_and_track_levels(self):
+        from pathlib import Path
+        from PyQt6.QtWidgets import QDialog, QDoubleSpinBox
+        with tempfile.TemporaryDirectory() as d, patch.dict(os.environ, {'APPDATA': d, 'XDG_DATA_HOME': d}):
+            source = Path(d) / 'source.mp4'; source.touch(); window = Window()
+            window.library.save_edit(source, {'in': .2, 'out': .7, 'volumes': {'1': .5, '2': 2}, 'mix_first': True})
+            seen = []
+            def inspect(dialog):
+                seen.extend(spin.value() for spin in dialog.findChildren(QDoubleSpinBox))
+                return QDialog.DialogCode.Rejected
+            info = {'format': {'duration': '10'}, 'streams': [{'codec_type': 'audio', 'index': 1}, {'codec_type': 'audio', 'index': 2}]}
+            with patch.object(window, 'selected', return_value=source), patch('clipper.app.probe', return_value=info), patch.object(QDialog, 'exec', inspect):
+                self.assertIsNone(window.selection(False))
+            self.assertEqual(seen, [2, 7, .5, 2])
             window.quitting = True; window.close()
 
     def test_quick_trim_exposes_mix_option(self):

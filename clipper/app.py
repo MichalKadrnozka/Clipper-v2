@@ -1,4 +1,4 @@
-"""Early desktop interface for the media library."""
+"""Main multiplatform Clipper window, recording, library and settings."""
 import os
 import json
 import queue
@@ -7,17 +7,20 @@ import sys
 import time
 import uuid
 from datetime import datetime
+from collections import OrderedDict
 from pathlib import Path
-from PyQt6.QtCore import QObject, QThread, QTimer, Qt, QUrl, QMimeData, QSize, QRect, QRectF, QFileSystemWatcher, pyqtSignal
+from PyQt6.QtCore import QObject, QThread, QTimer, Qt, QUrl, QMimeData, QSize, QRect, QRectF, QFileSystemWatcher, QByteArray, pyqtSignal
 from PyQt6.QtGui import QDesktopServices, QIcon, QColor, QImage, QPixmap, QPainter, QPainterPath, QPen, QShortcut, QKeySequence
 from PyQt6.QtWidgets import (QApplication, QDialog, QDialogButtonBox, QFileDialog, QFormLayout,
     QHBoxLayout, QInputDialog, QLabel, QLineEdit, QListWidget, QListWidgetItem, QListView, QMainWindow, QMessageBox,
     QPushButton, QDoubleSpinBox, QVBoxLayout, QGridLayout, QWidget, QGroupBox, QComboBox, QSpinBox, QTreeWidget, QTreeWidgetItem, QCheckBox, QMenu, QAbstractItemView, QSystemTrayIcon, QStyle, QHeaderView, QColorDialog, QStyledItemDelegate, QStyleOptionViewItem, QScrollArea, QTabWidget, QStackedWidget, QSplitter, QFrame)
-from .library import Library, group_clips
+from .library import Library, group_clips, clip_date
 from .media import duration, export, probe, trim, first_track_is_named_mix, Cancellation, MediaCancelled
 from .obs import OBSClient
 from .obs_setup import OBSSettings, configure_windows, device_options, set_devices, PROFILE, COLLECTION, ExtraAudioSource
-from .recorder import CaptureSettings, GSRRecorder, audio_sources, active_window_name, name_saved_replay
+from .recorder import (CaptureSettings, GSRRecorder, RecordingAudioTrack, audio_sources,
+    active_window_name, name_saved_replay, default_audio_output)
+from .audio_sources_ui import RecordingAudioEditor
 from .hotkeys import WindowsHotkeys, parse_hotkey
 from .startup import set_start_on_login, starts_on_login
 from .secrets import protect, unprotect
@@ -27,6 +30,17 @@ from .migration import import_legacy
 from .obs_process import launch_obs, wait_until_connected
 from . import linux_identity
 from .scaling import data_directory, valid_scale, apply_saved_scale
+from .theme import APP_STYLE
+from .widgets import PreviewLabel, ScaleSlider
+from .tools import external_environment
+
+def saved_int(library, key, default, minimum=None, maximum=None):
+    try: value = int(library.setting(key, str(default)))
+    except (TypeError, ValueError): value = default
+    if minimum is not None: value = max(minimum, value)
+    if maximum is not None: value = min(maximum, value)
+    return value
+
 
 class TagDelegate(QStyledItemDelegate):
     """Draw the saved tag colors as compact labels in the library."""
@@ -63,6 +77,17 @@ def ui_icon_path(name):
 
 class ClipCardDelegate(QStyledItemDelegate):
     """Draw the original Clipper card: wide 16:9 preview, top overlays, title bar."""
+    def __init__(self, parent=None):
+        super().__init__(parent); self.pixmaps = OrderedDict()
+        self.badge_icons = {name: QPixmap(ui_icon_path(name)).scaled(15, 15, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+            for name in ('icons8-trim-96.png', 'icons8-export-96.png')}
+    def image_for(self, path):
+        if not path: return QPixmap()
+        if path in self.pixmaps:
+            self.pixmaps.move_to_end(path); return self.pixmaps[path]
+        image = QPixmap(path); self.pixmaps[path] = image; self.pixmaps.move_to_end(path)
+        while len(self.pixmaps) > 512: self.pixmaps.popitem(last=False)
+        return image
     def sizeHint(self, option, index):
         view = self.parent()
         size = view.gridSize() if isinstance(view, QListView) else QSize(300, 205)
@@ -73,14 +98,15 @@ class ClipCardDelegate(QStyledItemDelegate):
         selected = bool(option.state & QStyle.StateFlag.State_Selected)
         hovered = bool(option.state & QStyle.StateFlag.State_MouseOver)
         border = QColor('#ff7300') if selected else QColor('#555555') if hovered else QColor('#222222')
-        painter.setPen(QPen(border, 5 if selected else 1)); painter.setBrush(QColor('#222222')); painter.drawRect(outer)
+        painter.setPen(QPen(border, 6 if selected else 1)); painter.setBrush(QColor('#222222')); painter.drawRoundedRect(outer, 6, 6)
+        clip_path = QPainterPath(); clip_path.addRoundedRect(QRectF(outer), 6, 6); painter.setClipPath(clip_path)
         thumb = outer.adjusted(3, 3, -3, -35); thumb.setHeight(min(thumb.width() * 9 // 16, outer.height() - 40))
         painter.fillRect(thumb, QColor('#000000'))
         preview = getattr(self.parent(), 'hover_preview', None)
         image = preview.pixmap_for(index) if preview else QPixmap()
         if image.isNull():
             image_path = index.data(Qt.ItemDataRole.UserRole + 4) or ''
-            image = QPixmap(image_path) if image_path else QPixmap()
+            image = self.image_for(image_path) if image_path else QPixmap()
         if not image.isNull():
             scaled = image.scaled(thumb.size(), Qt.AspectRatioMode.KeepAspectRatioByExpanding, Qt.TransformationMode.SmoothTransformation)
             x = (scaled.width() - thumb.width()) // 2; y = (scaled.height() - thumb.height()) // 2
@@ -106,13 +132,16 @@ class ClipCardDelegate(QStyledItemDelegate):
         for icon, enabled in badges:
             if enabled:
                 painter.setPen(Qt.PenStyle.NoPen); painter.setBrush(QColor(0, 0, 0, 190)); painter.drawEllipse(QRectF(bx, thumb.top()+6, 22, 22))
-                pixmap = QPixmap(ui_icon_path(icon)).scaled(15, 15, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
-                painter.drawPixmap(int(bx + 3), thumb.top() + 9, pixmap)
+                painter.drawPixmap(int(bx + 3), thumb.top() + 9, self.badge_icons[icon])
             bx -= 25
         title_bar = QRectF(outer.left()+1, outer.bottom()-31, outer.width()-2, 30)
-        painter.fillRect(title_bar, QColor('#222222'))
+        painter.fillRect(title_bar, QColor('#383838') if hovered else QColor('#222222'))
         name_rect = QRectF(title_bar.left()+8, title_bar.top(), title_bar.width()-16, title_bar.height())
-        painter.setPen(QColor('#ffffff')); painter.drawText(name_rect, Qt.AlignmentFlag.AlignVCenter, painter.fontMetrics().elidedText(index.data(Qt.ItemDataRole.DisplayRole) or '', Qt.TextElideMode.ElideRight, int(name_rect.width())))
+        font = painter.font(); font.setBold(True); painter.setFont(font)
+        title = index.data(Qt.ItemDataRole.DisplayRole) or ''
+        query = getattr(getattr(self.parent().window(), 'search', None), 'text', lambda: '')().casefold()
+        painter.setPen(QColor('#ff9000') if query and query in title.casefold() else QColor('#ffffff'))
+        painter.drawText(name_rect, Qt.AlignmentFlag.AlignVCenter, painter.fontMetrics().elidedText(title, Qt.TextElideMode.ElideRight, int(name_rect.width())))
         painter.restore()
 
 class ScreenPreviewJob(QThread):
@@ -132,7 +161,7 @@ class ScreenPreviewJob(QThread):
                 command = (['grim', '-o', self.screen_name, '-s', '0.5', '-t', 'png', '-l', '1', str(self.output)] if backend == 'grim'
                     else ['spectacle', '--background', '--nonotify', '--fullscreen', '--output', str(self.output)])
                 try:
-                    result = subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=8 if backend == 'spectacle' else 3)
+                    result = subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=8 if backend == 'spectacle' else 3, env=external_environment())
                     if result.returncode or not self.output.is_file():
                         errors.append(result.stderr.decode(errors='replace').strip() or f'{backend}: snímek není dostupný'); continue
                     if backend == 'spectacle' and self.screen_geometry and self.desktop_geometry and self.screen_geometry != self.desktop_geometry:
@@ -205,40 +234,15 @@ class Window(QMainWindow):
         super().__init__()
         self.setWindowTitle('Clipper')
         self.resize(1320, 860); self.setMinimumSize(720, 480)
-        self.setStyleSheet('''
-            QWidget { background: #121212; color: #eeeeee; font-size: 13px; }
-            QLabel, QCheckBox, QRadioButton { background: transparent; }
-            QLineEdit, QTreeWidget, QComboBox, QSpinBox, QDoubleSpinBox { background: #1e1e1e; border: 1px solid #444444; border-radius: 6px; padding: 7px 9px; selection-background-color: #ff7300; }
-            QPushButton { background: #1e1e1e; border: 1px solid #444444; border-radius: 6px; padding: 7px 12px; }
-            QPushButton:hover { background: #ff7300; border-color: #ff9000; color: white; }
-            QPushButton[primary="true"] { background: #ff7300; border-color: #ff7300; color: white; font-weight: bold; }
-            QPushButton[primary="true"]:hover { background: #ff9000; }
-            QPushButton:disabled { color: #777777; background: #252525; }
-            QCheckBox::indicator { width: 16px; height: 16px; border: 1px solid #666666; border-radius: 3px; background: #1e1e1e; }
-            QCheckBox::indicator:hover { border-color: #ff7300; }
-            QCheckBox::indicator:checked { background: #ff7300; border-color: #ff7300; }
-            QTabWidget::pane { border: 0; top: 0; background: #121212; }
-            QTabBar::tab { background: transparent; border: 0; border-bottom: 2px solid transparent; padding: 10px 16px 8px; margin: 0 2px; color: #aaaaaa; }
-            QTabBar::tab:selected { background: transparent; color: #ffffff; border-bottom: 2px solid #ff7300; }
-            QTabBar::tab:hover:!selected { color: #ffffff; border-bottom-color: #555555; }
-            QGroupBox { background: transparent; border: 0; border-radius: 8px; margin-top: 18px; padding: 8px 4px 4px; font-weight: bold; }
-            QGroupBox::title { subcontrol-origin: margin; left: 4px; padding: 0 6px; color: #eeeeee; }
-            QHeaderView::section { background: #282e39; padding: 6px; border: 0; }
-            QTreeWidget::item { padding: 3px; }
-            QTreeWidget::item:selected { background: #9b4e23; }
-            QTreeWidget::item:hover { background: #2a303c; }
-            QTreeWidget::branch { background: #202530; }
-            QScrollArea { border: 0; background: transparent; }
-            QSplitter::handle { background: #333333; width: 1px; }
-            QMenu { background: #2a2a2a; border: 1px solid #444444; }
-            QMenu::item:selected { background: #ff7300; }
-            QSlider::groove:horizontal { background: #333333; height: 6px; border-radius: 3px; }
-            QSlider::handle:horizontal { background: #ff7300; width: 14px; margin: -4px 0; border-radius: 7px; }
-        ''')
+        self.setStyleSheet(APP_STYLE)
         data = data_directory()
         data.mkdir(parents=True, exist_ok=True)
         self.data_path = data
         self.library = Library(data / 'library.sqlite3')
+        geometry = self.library.setting('window_geometry')
+        if geometry:
+            try: self.restoreGeometry(QByteArray.fromHex(geometry.encode('ascii')))
+            except (ValueError, TypeError): pass
         self.thumbnails = Thumbnails(data / 'thumbnails', self); self.thumbnails.ready.connect(self.thumbnail_ready); self.thumbnails.failed.connect(self.thumbnail_failed)
         self.folder = self.library.setting('folder')
         self.watcher = QFileSystemWatcher(self)
@@ -248,6 +252,7 @@ class Window(QMainWindow):
         if self.folder and Path(self.folder).is_dir(): self.watcher.addPath(self.folder)
         self.thread = None
         self.capture_thread = None
+        self.obs_pending_saves = 0
         self.obs_health_thread = None; self.obs_health_worker = None
         self.obs_metadata_jobs = set()
         self.obs_finalizing_paths = set()
@@ -255,11 +260,14 @@ class Window(QMainWindow):
         self.obs_health_connection = None; self.closing_after_health = False
         self.hotkeys = None
         self.portal_hotkeys = None
+        self.evdev_hotkeys = None
         self.obs_preview_worker = None; self.obs_preview_attempted = False
         self.obs_preview_retry_at = 0.; self.obs_preview_generation = 0
         self.screen_preview_worker = None
         self.screen_preview_backend = 'auto'
         self.quitting = False
+        self.gsr_save_close_deadline = None; self.gsr_save_abandoned = False
+        self.closing_after_jobs = False; self._restart_pending = False
         self.tray = None
         self.recorder = GSRRecorder()
         root = QWidget(); self.setCentralWidget(root); self.root_layout = QVBoxLayout(root)
@@ -271,16 +279,18 @@ class Window(QMainWindow):
         self.folder_label = QLabel(); self.folder_label.hide()
         # The original app put search and paging in the shared top bar, beside its three flat tabs.
         self.search = QLineEdit(); self.search.setPlaceholderText('Hledat klipy a tagy…'); self.search.setClearButtonEnabled(True); self.search.setFixedWidth(210); self.search.addAction(QIcon(ui_icon_path('icons8-search-96.png')), QLineEdit.ActionPosition.LeadingPosition)
+        self.search.setStyleSheet('QLineEdit { border-radius: 12px; padding-top: 4px; padding-bottom: 4px; }')
         self.search.textChanged.connect(self.search_changed)
         self.search_shortcut = QShortcut(QKeySequence('Ctrl+F'), self)
-        self.search_shortcut.activated.connect(lambda: (self.search.setFocus(), self.search.selectAll()))
+        self.search_shortcut.activated.connect(self.focus_library_search)
         self.library_count = QLabel('0 clips'); self.library_count.setStyleSheet('color:#aaaaaa;font-size:12px;font-weight:bold;')
+        self.calendar_icon = QLabel(); self.calendar_icon.setPixmap(QIcon(ui_icon_path('icons8-calendar-96.png')).pixmap(16, 16)); self.calendar_icon.hide()
         self.library_dates = QLabel(''); self.library_dates.setStyleSheet('color:#888888;font-size:12px;')
-        self.page_prev = QPushButton(); self.page_prev.setIcon(QIcon(ui_icon_path('icons8-back-96.png'))); self.page_prev.setFixedSize(32, 30); self.page_prev.clicked.connect(lambda: self.change_page(-1))
-        self.page_next = QPushButton(); self.page_next.setIcon(QIcon(ui_icon_path('icons8-forward-96.png'))); self.page_next.setFixedSize(32, 30); self.page_next.clicked.connect(lambda: self.change_page(1))
+        self.page_prev = QPushButton(); self.page_prev.setProperty('primary', True); self.page_prev.setIcon(QIcon(ui_icon_path('icons8-back-96.png'))); self.page_prev.setFixedSize(32, 30); self.page_prev.clicked.connect(lambda: self.change_page(-1))
+        self.page_next = QPushButton(); self.page_next.setProperty('primary', True); self.page_next.setIcon(QIcon(ui_icon_path('icons8-forward-96.png'))); self.page_next.setFixedSize(32, 30); self.page_next.clicked.connect(lambda: self.change_page(1))
         top_controls = QWidget(); top_controls.setStyleSheet('background:transparent;')
         top_row = QHBoxLayout(top_controls); top_row.setContentsMargins(0, 0, 12, 0); top_row.setSpacing(8)
-        top_row.addWidget(self.library_count); top_row.addSpacing(10); top_row.addWidget(self.library_dates)
+        top_row.addWidget(self.library_count); top_row.addSpacing(10); top_row.addWidget(self.calendar_icon); top_row.addWidget(self.library_dates)
         top_row.addSpacing(8); top_row.addWidget(self.page_prev); top_row.addWidget(self.page_next); top_row.addSpacing(10); top_row.addWidget(self.search)
         self.tabs.setCornerWidget(top_controls, Qt.Corner.TopRightCorner)
         self.browser_splitter = QSplitter(Qt.Orientation.Horizontal); library_layout.addWidget(self.browser_splitter, 1)
@@ -291,8 +301,6 @@ class Window(QMainWindow):
         self.list.setResizeMode(QListView.ResizeMode.Adjust); self.list.setMovement(QListView.Movement.Static); self.list.setWrapping(True)
         self.list.setGridSize(QSize(300, 205)); self.list.setSpacing(0); self.list.setIconSize(QSize(280, 158)); self.list.setWordWrap(True)
         self.list.setItemDelegate(ClipCardDelegate(self.list)); self.list.itemDoubleClicked.connect(lambda *_: self.open_editor())
-        placeholder = QPixmap(120, 68); placeholder.fill(Qt.GlobalColor.transparent)
-        self.thumbnail_placeholder = QIcon(placeholder)
         self.list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu); self.list.customContextMenuRequested.connect(self.context_menu)
         self.list.setMinimumWidth(260); self.list.setSelectionRectVisible(True); self.list.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
@@ -312,12 +320,12 @@ class Window(QMainWindow):
         empty_icon = QLabel('▤'); empty_icon.setAlignment(Qt.AlignmentFlag.AlignCenter); empty_icon.setStyleSheet('font-size:38px;color:#778398;'); empty_layout.addWidget(empty_icon)
         self.empty_title = QLabel('Knihovna čeká na klipy'); self.empty_title.setAlignment(Qt.AlignmentFlag.AlignCenter); self.empty_title.setStyleSheet('font-size:18px;font-weight:700;'); empty_layout.addWidget(self.empty_title)
         self.empty_message = QLabel('Vyber složku s videi, nebo začni nahrávat.'); self.empty_message.setAlignment(Qt.AlignmentFlag.AlignCenter); self.empty_message.setWordWrap(True); self.empty_message.setStyleSheet('color:#9da8ba;'); empty_layout.addWidget(self.empty_message)
-        empty_choose = QPushButton('Vybrat složku klipů'); empty_choose.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_DirOpenIcon)); empty_choose.setProperty('primary', True); empty_choose.clicked.connect(self.choose_folder); empty_layout.addWidget(empty_choose, 0, Qt.AlignmentFlag.AlignHCenter)
+        empty_choose = QPushButton('Vybrat složku klipů'); empty_choose.setIcon(QIcon(ui_icon_path('icons8-folder-96.png'))); empty_choose.setProperty('primary', True); empty_choose.clicked.connect(self.choose_folder); empty_layout.addWidget(empty_choose, 0, Qt.AlignmentFlag.AlignHCenter)
         browser_layout.addWidget(self.empty_state, 1)
         self.browser_splitter.addWidget(browser)
-        self.details_panel = QFrame(library_tab); self.details_panel.hide()
+        self.details_panel = QFrame(library_tab); self.details_panel.setProperty('panel', True); self.details_panel.hide()
         detail_layout = QVBoxLayout(self.details_panel); detail_layout.setContentsMargins(16, 16, 16, 16); detail_layout.setSpacing(11)
-        self.detail_thumbnail = QLabel('Vyber klip'); self.detail_thumbnail.setAlignment(Qt.AlignmentFlag.AlignCenter); self.detail_thumbnail.setMinimumHeight(190); self.detail_thumbnail.setMaximumHeight(250); self.detail_thumbnail.setStyleSheet('background:#10141b;border:1px solid #343b49;border-radius:9px;color:#788397;font-size:16px;'); detail_layout.addWidget(self.detail_thumbnail)
+        self.detail_thumbnail = PreviewLabel('Vyber klip'); self.detail_thumbnail.setAlignment(Qt.AlignmentFlag.AlignCenter); self.detail_thumbnail.setMinimumHeight(190); self.detail_thumbnail.setMaximumHeight(250); self.detail_thumbnail.setStyleSheet('background:#10141b;border:1px solid #343b49;border-radius:9px;color:#788397;font-size:16px;'); detail_layout.addWidget(self.detail_thumbnail)
         self.detail_title = QLabel('Žádný klip není vybraný'); self.detail_title.setWordWrap(True); self.detail_title.setStyleSheet('font-size:18px;font-weight:700;color:#f4f6fb;'); detail_layout.addWidget(self.detail_title)
         self.detail_version = QComboBox(); self.detail_version.setToolTip('Vyber, kterou verzi klipu chceš otevřít, stříhat nebo exportovat.')
         self.detail_version.currentIndexChanged.connect(self.detail_version_changed); detail_layout.addWidget(self.detail_version)
@@ -325,12 +333,12 @@ class Window(QMainWindow):
         self.detail_meta = QLabel('Kliknutím vyber klip. Dvojklik otevře editor.'); self.detail_meta.setWordWrap(True); self.detail_meta.setStyleSheet('color:#9da8ba;'); detail_layout.addWidget(self.detail_meta)
         self.detail_tags = QLabel(''); self.detail_tags.setWordWrap(True); self.detail_tags.setStyleSheet('color:#d6dcea;'); detail_layout.addWidget(self.detail_tags)
         detail_layout.addStretch(1)
-        detail_play = QPushButton('Přehrát'); detail_play.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPlay)); detail_play.clicked.connect(self.play); detail_layout.addWidget(detail_play)
-        detail_editor = QPushButton('Otevřít editor'); detail_editor.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_FileDialogDetailedView)); detail_editor.setProperty('primary', True); detail_editor.clicked.connect(self.open_editor); detail_layout.addWidget(detail_editor)
+        detail_play = QPushButton('Přehrát'); detail_play.setIcon(QIcon(ui_icon_path('icons8-play-96.png'))); detail_play.clicked.connect(self.play); detail_layout.addWidget(detail_play)
+        detail_editor = QPushButton('Otevřít editor'); detail_editor.setIcon(QIcon(ui_icon_path('icons8-edit-96.png'))); detail_editor.setProperty('primary', True); detail_editor.clicked.connect(self.open_editor); detail_layout.addWidget(detail_editor)
         detail_row = QHBoxLayout(); detail_layout.addLayout(detail_row)
-        detail_trim = QPushButton('Uložit střih'); detail_trim.clicked.connect(self.make_trim); detail_row.addWidget(detail_trim)
-        detail_export = QPushButton('Export'); detail_export.clicked.connect(self.make_export); detail_row.addWidget(detail_export)
-        detail_location = QPushButton('Otevřít umístění'); detail_location.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_DirOpenIcon)); detail_location.clicked.connect(self.open_location); detail_layout.addWidget(detail_location)
+        detail_trim = QPushButton('Uložit střih'); detail_trim.setIcon(QIcon(ui_icon_path('icons8-trim-96.png'))); detail_trim.clicked.connect(self.make_trim); detail_row.addWidget(detail_trim)
+        detail_export = QPushButton('Export'); detail_export.setIcon(QIcon(ui_icon_path('icons8-export-96.png'))); detail_export.clicked.connect(self.make_export); detail_row.addWidget(detail_export)
+        detail_location = QPushButton('Otevřít umístění'); detail_location.setIcon(QIcon(ui_icon_path('icons8-folder-96.png'))); detail_location.clicked.connect(self.open_location); detail_layout.addWidget(detail_location)
         self.details_panel.setMinimumWidth(240)
         self.browser_splitter.addWidget(self.details_panel)
         self.browser_splitter.setStretchFactor(0, 1)
@@ -355,17 +363,22 @@ class Window(QMainWindow):
         tags_button = QPushButton('Spravovat tagy…'); tags_button.clicked.connect(self.manage_tags); general_actions.addWidget(tags_button)
         scale_row = QHBoxLayout(); general_layout.addLayout(scale_row)
         scale_row.addWidget(QLabel('Měřítko UI:'))
-        self.ui_scale = QSpinBox(); self.ui_scale.setRange(50, 200); self.ui_scale.setSingleStep(10); self.ui_scale.setSuffix(' %'); self.ui_scale.setMaximumWidth(220)
-        self.ui_scale.setToolTip('Změna se projeví po opětovném spuštění aplikace.')
+        self.ui_scale = ScaleSlider(); self.ui_scale.setMinimumWidth(260); self.ui_scale.setMaximumWidth(440)
+        self.ui_scale.setToolTip('Velikost celého rozhraní se použije po restartu aplikace.')
         self.ui_scale.setValue(round((valid_scale(self.library.setting('ui_scale', '1')) or 1) * 100))
-        self.ui_scale.valueChanged.connect(self.set_ui_scale); scale_row.addWidget(self.ui_scale); scale_row.addStretch(1)
+        self._initial_ui_scale = self.ui_scale.value()
+        self.scale_restart = QPushButton('Restartovat a použít'); self.scale_restart.setEnabled(False)
+        self.scale_restart.setProperty('danger', True); self.scale_restart.clicked.connect(self.restart_application)
+        self.ui_scale.valueChanged.connect(self.set_ui_scale)
+        scale_row.addWidget(self.ui_scale, 1); scale_row.addWidget(self.scale_restart); scale_row.addStretch(1)
         if sys.platform.startswith('linux'):
             capture_tab = QWidget(); self.tabs.insertTab(0, capture_tab, 'Nahrávání')
-            capture_layout = QVBoxLayout(capture_tab); capture_layout.setContentsMargins(10, 6, 10, 8); capture_layout.setSpacing(6)
+            capture_layout = QVBoxLayout(capture_tab); capture_layout.setContentsMargins(18, 14, 18, 12); capture_layout.setSpacing(8)
+            capture_heading = QLabel('Nahrávání'); capture_heading.setProperty('heading', True); capture_layout.addWidget(capture_heading)
             backend_row = QHBoxLayout(); capture_layout.addLayout(backend_row)
             backend_row.addWidget(QLabel('Záznamový systém:'))
             self.backend_combo = QComboBox(); self.backend_combo.addItems(['GPU Screen Recorder', 'OBS Studio'])
-            self.backend_combo.setCurrentIndex(max(0, min(1, int(self.library.setting('linux_backend', '0')))))
+            self.backend_combo.setCurrentIndex(saved_int(self.library, 'linux_backend', 0, 0, 1))
             backend_row.addWidget(self.backend_combo); backend_row.addStretch(1)
             capture_pages = QStackedWidget(); capture_layout.addWidget(capture_pages, 1)
             self.backend_combo.currentIndexChanged.connect(lambda index: capture_pages.setCurrentIndex(index))
@@ -380,11 +393,13 @@ class Window(QMainWindow):
             self.display = QComboBox(); self.display.setMinimumWidth(150)
             for screen in QApplication.screens(): self.display.addItem(screen.name())
             self.display.setCurrentText(self.library.setting('display', self.display.currentText()))
-            self.seconds = QSpinBox(); self.seconds.setRange(1, 3600); self.seconds.setValue(int(self.library.setting('seconds', '60'))); self.seconds.setSuffix(' s')
-            self.fps = QSpinBox(); self.fps.setRange(1, 240); self.fps.setValue(int(self.library.setting('fps', '60'))); self.fps.setSuffix(' FPS')
+            self.seconds = QSpinBox(); self.seconds.setRange(1, 3600); self.seconds.setValue(saved_int(self.library, 'seconds', 60)); self.seconds.setSuffix(' s')
+            self.fps = QSpinBox(); self.fps.setRange(1, 240); self.fps.setValue(saved_int(self.library, 'fps', 60)); self.fps.setSuffix(' FPS')
             self.codec = QComboBox(); self.codec.addItems(['h264', 'hevc', 'av1']); self.codec.setCurrentText(self.library.setting('codec', 'h264'))
             self.format = QComboBox(); self.format.addItems(['mkv', 'mp4']); self.format.setCurrentText(self.library.setting('format', 'mkv'))
-            self.quality = QComboBox(); self.quality.addItems(['medium', 'high', 'very_high', 'ultra']); self.quality.setCurrentText(self.library.setting('quality', 'high'))
+            self.quality = QComboBox()
+            for label, value in [('Střední', 'medium'), ('Vysoká', 'high'), ('Velmi vysoká', 'very_high'), ('Ultra', 'ultra')]: self.quality.addItem(label, value)
+            self.quality.setCurrentIndex(max(0, self.quality.findData(self.library.setting('quality', 'high'))))
             self.resolution = QLineEdit(self.library.setting('resolution', '')); self.resolution.setPlaceholderText('Původní'); self.resolution.setToolTip('Ponechte prázdné pro nativní rozlišení obrazovky.')
             fields = [('Displej', self.display), ('Délka', self.seconds), ('Snímkování', self.fps), ('Kodek', self.codec), ('Kontejner', self.format), ('Kvalita', self.quality), ('Rozlišení', self.resolution)]
             for index, (caption, widget) in enumerate(fields):
@@ -394,24 +409,49 @@ class Window(QMainWindow):
                 native_layout.addWidget(label, row * 2, column); native_layout.addWidget(widget, row * 2 + 1, column)
                 native_layout.setColumnStretch(column + 1, 1)
             native_layout.setColumnStretch(0, 1); native_layout.setColumnStretch(2, 1)
-            audio_row = QHBoxLayout(); native_box.addLayout(audio_row)
-            audio_label = QLabel('Zvukové zdroje'); audio_label.setMinimumWidth(92); audio_label.setStyleSheet('color: #9da8ba; font-size: 11px;'); audio_row.addWidget(audio_label)
-            self.audio_device = QLineEdit(self.library.setting('audio_device', '')); self.audio_device.setPlaceholderText('Zdroje PulseAudio / PipeWire'); self.audio_device.setToolTip('Více zařízení oddělte středníkem.'); audio_row.addWidget(self.audio_device, 1)
-            choose_audio = QPushButton('Vybrat zdroje…'); choose_audio.clicked.connect(self.choose_audio_sources); audio_row.addWidget(choose_audio)
+            self.quality_estimate = QLabel(''); self.quality_estimate.setProperty('muted', True); native_box.addWidget(self.quality_estimate)
+            audio_group = QGroupBox('Zvukové stopy'); native_box.addWidget(audio_group)
+            audio_box = QVBoxLayout(audio_group)
+            try: saved_tracks = json.loads(self.library.setting('gsr_audio_tracks', '[]'))
+            except (TypeError, ValueError): saved_tracks = []
+            if not isinstance(saved_tracks, list): saved_tracks = []
+            if not saved_tracks and self.library.setting('audio_device'):
+                saved_tracks = [{'device': value.strip(), 'name': value.strip(), 'gain': 1.0}
+                    for value in self.library.setting('audio_device').split(';') if value.strip()]
+            if not saved_tracks: saved_tracks = [{'device': default_audio_output(), 'name': 'Výstup počítače', 'gain': 1.0}]
+            self.audio_tracks_editor = RecordingAudioEditor(saved_tracks); audio_box.addWidget(self.audio_tracks_editor)
+            self.audio_tracks_editor.changed.connect(self.save_recording_settings)
+            refresh_audio = QPushButton('Aktualizovat dostupná zařízení'); refresh_audio.clicked.connect(self.choose_audio_sources)
+            audio_box.addWidget(refresh_audio, 0, Qt.AlignmentFlag.AlignLeft)
+            buffer_group = QGroupBox('Replay buffer'); native_box.addWidget(buffer_group)
+            buffer_note = QLabel('Buffer průběžně uchovává zvolený počet sekund. Tlačítko Uložit klip vytvoří videosoubor ve složce knihovny.')
+            buffer_note.setWordWrap(True); buffer_note.setProperty('muted', True); buffer_layout = QVBoxLayout(buffer_group); buffer_layout.addWidget(buffer_note)
             native_box.setAlignment(Qt.AlignmentFlag.AlignTop)
+            for widget in (self.display, self.codec, self.format, self.quality):
+                widget.currentIndexChanged.connect(self.save_recording_settings)
+            self.resolution.textChanged.connect(self.save_recording_settings)
+            self.seconds.valueChanged.connect(self.recording_setting_changed)
+            self.fps.valueChanged.connect(self.recording_setting_changed)
+            for combo in (self.display, self.codec, self.format, self.quality): combo.currentIndexChanged.connect(self.recording_setting_changed)
+            self.resolution.textChanged.connect(self.recording_setting_changed)
+            self.save_recording_button = QPushButton('Uložit změny a restartovat buffer'); self.save_recording_button.setProperty('primary', True)
+            self.save_recording_button.clicked.connect(self.restart_gsr); self.save_recording_button.hide(); native_box.addWidget(self.save_recording_button)
             capture_controls = QWidget(); controls_layout = QVBoxLayout(capture_controls); controls_layout.setContentsMargins(0, 4, 0, 4); controls_layout.setSpacing(10)
-            self.gsr_preview = QLabel('Živý náhled'); self.gsr_preview.setAlignment(Qt.AlignmentFlag.AlignCenter); self.gsr_preview.setMinimumSize(260, 150); self.gsr_preview.setStyleSheet('background:#000000;border:1px solid #333333;border-radius:8px;color:#888888;'); controls_layout.addWidget(self.gsr_preview, 1)
+            controls_layout.addStretch(1)
+            self.gsr_preview = PreviewLabel('Živý náhled'); self.gsr_preview.setAlignment(Qt.AlignmentFlag.AlignCenter); self.gsr_preview.setMinimumSize(260, 150); self.gsr_preview.setMaximumHeight(460); self.gsr_preview.setStyleSheet('background:#000000;border:1px solid #333333;border-radius:8px;color:#888888;'); controls_layout.addWidget(self.gsr_preview)
             self.gsr_state_label = QLabel('Stav: buffer zastaven'); self.gsr_state_label.setStyleSheet('color:#888888;font-family:monospace;'); controls_layout.addWidget(self.gsr_state_label)
             action_row = QHBoxLayout(); controls_layout.addLayout(action_row)
-            self.gsr_start_button = QPushButton('Spustit nahrávání'); self.gsr_start_button.setProperty('primary', True); self.gsr_start_button.setMinimumHeight(45); self.gsr_start_button.clicked.connect(lambda: self.gsr_action('start')); action_row.addWidget(self.gsr_start_button, 1)
-            self.gsr_save_button = QPushButton('Uložit klip'); self.gsr_save_button.setMinimumHeight(45); self.gsr_save_button.setEnabled(False); self.gsr_save_button.clicked.connect(lambda: self.gsr_action('save')); action_row.addWidget(self.gsr_save_button, 1)
-            self.gsr_stop_button = QPushButton('Zastavit buffer'); self.gsr_stop_button.setEnabled(False); self.gsr_stop_button.clicked.connect(lambda: self.gsr_action('stop')); controls_layout.addWidget(self.gsr_stop_button)
+            self.gsr_start_button = QPushButton('Spustit nahrávání'); self.gsr_start_button.setProperty('record', True); self.gsr_start_button.setMinimumHeight(45); self.gsr_start_button.clicked.connect(lambda: self.gsr_action('start')); action_row.addWidget(self.gsr_start_button, 1)
+            self.gsr_save_button = QPushButton('Uložit klip'); self.gsr_save_button.setProperty('primary', True); self.gsr_save_button.setMinimumHeight(45); self.gsr_save_button.setEnabled(False); self.gsr_save_button.clicked.connect(lambda: self.gsr_action('save')); action_row.addWidget(self.gsr_save_button, 1)
+            self.gsr_stop_button = QPushButton('Zastavit buffer'); self.gsr_stop_button.setProperty('danger', True); self.gsr_stop_button.setEnabled(False); self.gsr_stop_button.clicked.connect(lambda: self.gsr_action('stop')); controls_layout.addWidget(self.gsr_stop_button)
             self.seconds.valueChanged.connect(lambda value: self.gsr_save_button.setText(f'Uložit posledních {value} s'))
             self.folder_hint = QLabel('Ukládání do: ' + (self.folder or 'Vyber složku klipů v Nastavení')); self.folder_hint.setWordWrap(True); self.folder_hint.setStyleSheet('color:#888888;font-size:11px;'); controls_layout.addWidget(self.folder_hint)
+            controls_layout.addStretch(1)
             gsr_layout.addWidget(capture_controls, 4)
         if sys.platform != 'linux':
             capture_tab = QWidget(); self.tabs.insertTab(0, capture_tab, 'Nahrávání')
-            capture_layout = QVBoxLayout(capture_tab); capture_layout.setContentsMargins(10, 6, 10, 8); capture_layout.setSpacing(6)
+            capture_layout = QVBoxLayout(capture_tab); capture_layout.setContentsMargins(18, 14, 18, 12); capture_layout.setSpacing(8)
+            capture_heading = QLabel('Nahrávání'); capture_heading.setProperty('heading', True); capture_layout.addWidget(capture_heading)
             capture_pages = QStackedWidget(); capture_layout.addWidget(capture_pages, 1)
         if sys.platform.startswith('linux'):
             obs_page = QWidget(); capture_pages.addWidget(obs_page)
@@ -440,18 +480,24 @@ class Window(QMainWindow):
         if sys.platform == 'win32':
             setup_button = QPushButton('Nastavit OBS…'); setup_button.clicked.connect(self.configure_obs); connection_row.addWidget(setup_button)
             devices_button = QPushButton('Zdroje…'); devices_button.clicked.connect(self.choose_obs_devices); connection_row.addWidget(devices_button)
-        obs_help = QLabel('Připoj OBS WebSocket. Nahrávací profil, samostatné audio stopy a replay buffer můžeš nakonfigurovat přes Nastavit OBS.'); obs_help.setWordWrap(True); obs_help.setStyleSheet('color:#9da8ba;padding:6px 2px;'); record_layout.addWidget(obs_help)
+        help_text = ('Připoj OBS WebSocket. Nahrávací profil, samostatné audio stopy a replay buffer můžeš nakonfigurovat přes Nastavit OBS.'
+            if sys.platform == 'win32' else 'Připoj OBS WebSocket. Obrazové i zvukové zdroje a formát replay bufferu nastav přímo v OBS Studio.')
+        obs_help = QLabel(help_text); obs_help.setWordWrap(True); obs_help.setProperty('muted', True); record_layout.addWidget(obs_help)
         record_layout.addStretch(1)
         obs_controls = QWidget(); obs_layout.addWidget(obs_controls, 4)
         obs_controls_layout = QVBoxLayout(obs_controls); obs_controls_layout.setContentsMargins(0, 4, 0, 4); obs_controls_layout.setSpacing(10)
-        self.obs_preview = QLabel('Živý náhled'); self.obs_preview.setAlignment(Qt.AlignmentFlag.AlignCenter); self.obs_preview.setMinimumSize(260, 150); self.obs_preview.setStyleSheet('background:#000000;border:1px solid #333333;border-radius:8px;color:#888888;'); obs_controls_layout.addWidget(self.obs_preview, 1)
+        obs_controls_layout.addStretch(1)
+        self.obs_preview = PreviewLabel('Živý náhled'); self.obs_preview.setAlignment(Qt.AlignmentFlag.AlignCenter); self.obs_preview.setMinimumSize(260, 150); self.obs_preview.setMaximumHeight(460); self.obs_preview.setStyleSheet('background:#000000;border:1px solid #333333;border-radius:8px;color:#888888;'); obs_controls_layout.addWidget(self.obs_preview)
         self.obs_state_label = QLabel('Stav: OBS není připojeno'); self.obs_state_label.setStyleSheet('color:#888888;font-family:monospace;'); obs_controls_layout.addWidget(self.obs_state_label)
         obs_state_help = QLabel('Spusť buffer před hraním. Klip uloží poslední nastavený interval.'); obs_state_help.setAlignment(Qt.AlignmentFlag.AlignCenter); obs_state_help.setWordWrap(True); obs_state_help.setStyleSheet('color:#9da8ba;'); obs_controls_layout.addWidget(obs_state_help)
         recording_actions = QHBoxLayout(); obs_controls_layout.addLayout(recording_actions)
         for title, operation in [('Stav', 'status'), ('Spustit', 'start'), ('Uložit klip', 'save'), ('Zastavit', 'stop')]:
             button = QPushButton(title); button.clicked.connect(lambda checked=False, op=operation: self.obs_action(op)); button.setMinimumHeight(45)
             if operation == 'save': button.setProperty('primary', True)
+            if operation == 'start': button.setProperty('record', True)
+            if operation == 'stop': button.setProperty('danger', True)
             recording_actions.addWidget(button, 1)
+        obs_controls_layout.addStretch(1)
         if sys.platform == 'win32':
             shortcut_group = QGroupBox('Globální klávesové zkratky'); settings_layout.addWidget(shortcut_group)
             shortcuts = QGridLayout(shortcut_group)
@@ -480,16 +526,27 @@ class Window(QMainWindow):
             obs_path_button = QPushButton('Vybrat umístění OBS…'); obs_path_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_DirOpenIcon)); obs_path_button.clicked.connect(self.select_obs_path); options.addWidget(obs_path_button, 0, Qt.AlignmentFlag.AlignLeft)
         if sys.platform.startswith('linux'):
             shortcut_group = QGroupBox('Globální klávesové zkratky'); settings_layout.addWidget(shortcut_group)
-            shortcut_row = QHBoxLayout(shortcut_group)
-            shortcut_row.addWidget(QLabel('Záznamový systém:'))
+            shortcut_layout = QGridLayout(shortcut_group); shortcut_layout.setHorizontalSpacing(10)
+            shortcut_layout.addWidget(QLabel('Záznamový systém:'), 0, 0)
             self.shortcut_backend = QComboBox(); self.shortcut_backend.addItems(['GPU Screen Recorder', 'OBS Studio'])
-            self.shortcut_backend.setCurrentIndex(int(self.library.setting('linux_backend', '0')))
+            self.shortcut_backend.setCurrentIndex(saved_int(self.library, 'linux_backend', 0, 0, 1))
             self.shortcut_backend.currentIndexChanged.connect(lambda i: self.library.set_setting('linux_backend', str(i)))
             if hasattr(self, 'backend_combo'):
                 self.backend_combo.currentIndexChanged.connect(self.shortcut_backend.setCurrentIndex)
                 self.shortcut_backend.currentIndexChanged.connect(self.backend_combo.setCurrentIndex)
-            shortcut_row.addWidget(self.shortcut_backend, 1)
-            shortcut_button = QPushButton('Nastavit zkratky systému…'); shortcut_button.clicked.connect(self.setup_portal_shortcuts); shortcut_row.addWidget(shortcut_button)
+            shortcut_layout.addWidget(self.shortcut_backend, 0, 1)
+            shortcut_layout.addWidget(QLabel('Přístup ke zkratkám:'), 1, 0)
+            self.hotkey_method = QComboBox(); self.hotkey_method.addItem('Systémový portál (doporučeno)', 'portal'); self.hotkey_method.addItem('evdev fallback', 'evdev')
+            self.hotkey_method.setCurrentIndex(max(0, self.hotkey_method.findData(self.library.setting('linux_hotkey_method', 'portal'))))
+            shortcut_layout.addWidget(self.hotkey_method, 1, 1)
+            self.save_key = QLineEdit(self.library.setting('save_key', 'F10')); self.save_key.setPlaceholderText('Např. PageUp nebo Ctrl+P')
+            self.toggle_key = QLineEdit(self.library.setting('toggle_key', 'F9')); self.toggle_key.setPlaceholderText('Např. F9 nebo Ctrl+Shift+F9')
+            shortcut_layout.addWidget(QLabel('Uložit poslední klip:'), 2, 0); shortcut_layout.addWidget(self.save_key, 2, 1)
+            shortcut_layout.addWidget(QLabel('Zapnout / vypnout buffer:'), 3, 0); shortcut_layout.addWidget(self.toggle_key, 3, 1)
+            shortcut_button = QPushButton('Použít zkratky'); shortcut_button.setProperty('primary', True); shortcut_button.clicked.connect(self.apply_linux_hotkeys)
+            shortcut_layout.addWidget(shortcut_button, 2, 2, 2, 1)
+            hotkey_help = QLabel('Portál funguje bez administrátorských práv na podporovaných desktopech. evdev je fallback pro ostatní systémy a může vyžadovat přístup k /dev/input a balíček evdev.')
+            hotkey_help.setWordWrap(True); hotkey_help.setProperty('muted', True); shortcut_layout.addWidget(hotkey_help, 4, 0, 1, 3)
             startup_group = QGroupBox('Při spuštění'); settings_layout.addWidget(startup_group)
             startup_layout = QVBoxLayout(startup_group)
             self.linux_login = QCheckBox('Spustit po přihlášení'); self.linux_login.setChecked(linux_identity.starts_on_login())
@@ -500,8 +557,11 @@ class Window(QMainWindow):
             self.linux_auto_shortcuts.setToolTip('Po přihlášení se pokusí automaticky registrovat zkratky na podporovaném desktopu.')
             self.linux_auto_shortcuts.toggled.connect(lambda checked: self.library.set_setting('linux_auto_shortcuts', '1' if checked else '0')); startup_layout.addWidget(self.linux_auto_shortcuts)
         settings_layout.addStretch(1)
+        self.audio_sources_loaded = False
         self.tabs.currentChanged.connect(lambda index: top_controls.setVisible(index == self.tabs.indexOf(library_tab)))
+        self.tabs.currentChanged.connect(self.handle_tab_changed)
         self.tabs.setCurrentIndex(self.tabs.indexOf(library_tab))  # původní Clipper otevřel přímo galerii
+        if self.library.setting('window_maximized') == '1': self.showMaximized()
         self.status_container = QWidget(); status_container = self.status_container; status_row = QHBoxLayout(status_container); status_row.setContentsMargins(10, 0, 10, 4)
         self.status = TransientStatusLabel(status_container); self.status.setStyleSheet('color:#888888;'); status_row.addWidget(self.status, 1)
         self.cancel_button = QPushButton('Zrušit zpracování'); self.cancel_button.setEnabled(False)
@@ -517,6 +577,7 @@ class Window(QMainWindow):
             self.tray.setContextMenu(tray_menu)
             self.tray.activated.connect(lambda reason: self.show_normal() if reason == QSystemTrayIcon.ActivationReason.DoubleClick else None)
             self.tray.setToolTip('Clipper'); self.tray.show()
+        if hasattr(self, 'gsr_start_button'): self.set_gsr_ui_state(False); self.recording_setting_changed()
         self.refresh()
         self.record_timer = QTimer(self); self.record_timer.setInterval(1000); self.record_timer.timeout.connect(self.check_native_recorder); self.record_timer.start()
         self.preview_timer = QTimer(self); self.preview_timer.setInterval(1000); self.preview_timer.timeout.connect(self.update_screen_preview); self.preview_timer.start()
@@ -526,6 +587,9 @@ class Window(QMainWindow):
         if sys.platform.startswith('linux') and self.linux_auto.isChecked():
             QTimer.singleShot(500, lambda: self.gsr_action('start') if self.shortcut_backend.currentIndex() == 0 else self.obs_action('start'))
         if sys.platform.startswith('linux') and self.linux_auto_shortcuts.isChecked(): QTimer.singleShot(700, self.setup_portal_shortcuts)
+    def handle_tab_changed(self, index):
+        if index == 0 and sys.platform.startswith('linux') and hasattr(self, 'audio_tracks_editor') and not self.audio_sources_loaded:
+            self.audio_sources_loaded = True; self.choose_audio_sources()
     def backend_changed(self, index):
         self.reset_obs_preview()
         QTimer.singleShot(0, self.update_screen_preview)
@@ -566,7 +630,7 @@ class Window(QMainWindow):
         pixmap = QPixmap()
         if not pixmap.loadFromData(data): return
         self.obs_preview.setText('')
-        self.obs_preview.setPixmap(pixmap.scaled(self.obs_preview.size(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
+        self.obs_preview.setPixmap(pixmap)
     def set_obs_inline_error(self, message):
         if not hasattr(self, 'obs_preview'): return
         self.obs_preview.setPixmap(QPixmap())
@@ -591,7 +655,7 @@ class Window(QMainWindow):
             try: frame = screen.grabWindow(0)
             except Exception: frame = QPixmap()
             if not frame.isNull():
-                widget.setText(''); widget.setPixmap(frame.scaled(widget.size(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)); return
+                widget.setText(''); widget.setPixmap(frame); return
             widget.setPixmap(QPixmap()); widget.setText('Náhled obrazovky není dostupný'); return
         if self.screen_preview_worker and self.screen_preview_worker.isRunning(): return
         desktop = QRect(screen.geometry())
@@ -615,22 +679,48 @@ class Window(QMainWindow):
         frame = QPixmap()
         if not frame.loadFromData(data):
             self.set_screen_preview_error(widget, 'obrazovku se nepodařilo dekódovat'); return
-        widget.setText(''); widget.setPixmap(frame.scaled(widget.size(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
+        widget.setText(''); widget.setPixmap(frame)
     def set_screen_preview_error(self, widget, message):
         widget.setPixmap(QPixmap())
         detail = 'Náhled není dostupný; nahrávání může stále fungovat.'
         if message and QApplication.platformName().lower() != 'offscreen': detail += '\n' + message
         widget.setText(detail)
     def set_ui_scale(self, percent):
-        self.library.set_setting('ui_scale', str(percent / 100))
-        self.status.setText('Měřítko rozhraní se změní po opětovném spuštění aplikace.')
+        snapped = max(50, min(200, round(percent / 10) * 10))
+        if snapped != percent:
+            self.ui_scale.blockSignals(True); self.ui_scale.setValue(snapped); self.ui_scale.blockSignals(False)
+            percent = snapped
+        self.scale_restart.setEnabled(percent != self._initial_ui_scale)
+        if self.scale_restart.isEnabled():
+            self.status.setText('Měřítko rozhraní se použije po restartu aplikace.')
+    def restart_application(self):
+        busy = (self.active_editor is not None or self.obs_metadata_jobs or
+                any(thread is not None and thread.isRunning() for thread in
+                    (self.thread, self.capture_thread, self.obs_health_thread,
+                     self.obs_preview_worker, self.screen_preview_worker)))
+        if busy:
+            QMessageBox.information(self, 'Práce probíhá', 'Před restartem počkej na dokončení aktuální operace.'); return
+        self.library.set_setting('ui_scale', str(self.ui_scale.value() / 100))
+        self._restart_pending = True; self.quitting = True
+        self.close()
+    def launch_replacement(self):
+        arguments = [sys.executable] if getattr(sys, 'frozen', False) else [sys.executable, '-m', 'clipper']
+        try:
+            subprocess.Popen(arguments, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                start_new_session=sys.platform != 'win32',
+                creationflags=(subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP) if sys.platform == 'win32' else 0)
+        except OSError as exc:
+            QMessageBox.warning(None, 'Restart', 'Aplikaci se nepodařilo znovu spustit: ' + str(exc))
+        QApplication.quit()
     def set_obs_expected(self, active, connection):
         self.obs_generation += 1
         self.obs_expected = active; self.obs_health_connection = connection
         self.obs_failures = 0; self.obs_warned = False
         if active: self.obs_health_timer.start()
         else: self.obs_health_timer.stop()
-        if hasattr(self, 'obs_state_label'): self.obs_state_label.setText('Replay buffer běží' if active else 'Replay buffer zastaven')
+        if hasattr(self, 'obs_state_label'):
+            self.obs_state_label.setStyleSheet('color:#51ff00;font-family:monospace;' if active else 'color:#aaaaaa;font-family:monospace;')
+            self.obs_state_label.setText('Replay buffer běží' if active else 'Replay buffer zastaven')
     def check_obs_health(self):
         if not self.obs_expected or self.obs_health_thread or not self.obs_health_connection: return
         if self.capture_thread and self.capture_thread.isRunning(): return
@@ -664,25 +754,29 @@ class Window(QMainWindow):
     def check_native_recorder(self):
         if self.recorder.expect_running and not self.recorder.running:
             self.recorder.expect_running = False
-            detail = '\n'.join(self.recorder.log)[-500:] or 'Nahrávací proces se neočekávaně ukončil.'
+            detail = self.recorder.log_snapshot()[-500:] if hasattr(self.recorder, 'log_snapshot') else '\n'.join(tuple(self.recorder.log))[-500:]
+            detail = detail or 'Nahrávací proces se neočekávaně ukončil.'
+            self.set_gsr_ui_state(False, 'Nahrávání se neočekávaně zastavilo')
             self.status.setText('Nahrávání se zastavilo: ' + detail)
             if self.tray: self.tray.showMessage('Clipper — nahrávání se zastavilo', detail[:200], QSystemTrayIcon.MessageIcon.Warning)
         while True:
             try: saved = self.recorder.saved.get_nowait()
             except queue.Empty: break
             path = saved.path
-            self.remember_tracks(path, saved.first_is_mix, saved.track_names)
+            self.remember_tracks(path, saved.first_is_mix, saved.track_names, saved.track_volumes)
             self.status.setText('Klip uložen: ' + path); self.refresh()
             if self.tray: self.tray.showMessage('Clipper', 'Klip uložen: ' + Path(path).name)
     def remember_mix(self, path, track_names=None):
         self.remember_tracks(path, True, track_names)
-    def remember_tracks(self, path, first_is_mix, track_names=None):
+    def remember_tracks(self, path, first_is_mix, track_names=None, track_volumes=None):
         edit = self.library.edit_for(path)
         changed = False
         if 'mix_first' not in edit:
             edit['mix_first'] = bool(first_is_mix); changed = True
         if track_names and 'track_names' not in edit:
             edit['track_names'] = list(track_names); changed = True
+        if track_volumes and 'volumes' not in edit:
+            edit['volumes'] = dict(track_volumes); changed = True
         if changed: self.library.save_edit(path, edit)
     def set_linux_login(self, enabled):
         try: linux_identity.set_login_start(enabled)
@@ -692,17 +786,64 @@ class Window(QMainWindow):
     def save_from_tray(self):
         if sys.platform.startswith('linux') and self.shortcut_backend.currentIndex() == 0: self.gsr_action('save')
         else: self.obs_action('save')
+    def apply_linux_hotkeys(self):
+        bindings = {'save': self.save_key.text().strip(), 'toggle': self.toggle_key.text().strip()}
+        if len({value.casefold() for value in bindings.values()}) != 2:
+            QMessageBox.warning(self, 'Zkratky', 'Zkratky pro uložení a přepnutí musí být různé.'); return
+        method = self.hotkey_method.currentData()
+        try:
+            if method == 'evdev':
+                from .evdev_hotkeys import parse_evdev_hotkey
+                for value in bindings.values(): parse_evdev_hotkey(value)
+            else:
+                from .portal_hotkeys import portal_trigger
+                for value in bindings.values(): portal_trigger(value)
+        except (ImportError, ValueError) as exc:
+            QMessageBox.warning(self, 'Zkratky', str(exc)); return
+        if not self.stop_portal_hotkeys() or not self.stop_evdev_hotkeys():
+            QMessageBox.information(self, 'Zkratky', 'Předchozí zkratky se ještě ukončují. Zkus to znovu za okamžik.'); return
+        try:
+            if method == 'evdev':
+                from .evdev_hotkeys import EvdevHotkeys
+                worker = EvdevHotkeys(bindings, self); self.evdev_hotkeys = worker
+                worker.registered.connect(self.linux_hotkeys_registered)
+            else:
+                from .portal_hotkeys import PortalHotkeys
+                worker = PortalHotkeys(bindings, self); self.portal_hotkeys = worker
+                worker.bound.connect(self.linux_hotkeys_registered)
+        except (ImportError, ValueError) as exc:
+            QMessageBox.warning(self, 'Zkratky', str(exc)); return
+        worker.activated.connect(self.portal_action)
+        worker.error.connect(lambda msg: self.status.setText(msg))
+        worker.finished.connect(lambda: self.linux_hotkeys_finished(worker))
+        worker.start()
+        self.library.set_setting('linux_hotkey_method', method)
+    def linux_hotkeys_registered(self):
+        self.library.set_setting('save_key', self.save_key.text().strip())
+        self.library.set_setting('toggle_key', self.toggle_key.text().strip())
+        self.status.setText('Globální zkratky jsou aktivní.')
+    def linux_hotkeys_finished(self, worker):
+        if self.portal_hotkeys is worker: self.portal_hotkeys = None
+        if self.evdev_hotkeys is worker: self.evdev_hotkeys = None
+        worker.deleteLater()
+    def stop_portal_hotkeys(self):
+        worker = self.portal_hotkeys
+        if worker is None: return True
+        self.portal_hotkeys = None; worker.requestInterruption()
+        if not worker.wait(7000):
+            self.portal_hotkeys = worker; return False
+        worker.deleteLater(); return True
+    def stop_evdev_hotkeys(self):
+        worker = self.evdev_hotkeys
+        if worker is None: return True
+        self.evdev_hotkeys = None; worker.requestInterruption()
+        if not worker.wait(2000):
+            self.evdev_hotkeys = worker; return False
+        worker.deleteLater(); return True
     def setup_portal_shortcuts(self):
         if self.portal_hotkeys and self.portal_hotkeys.isRunning():
             self.status.setText('Globální zkratky již běží.'); return
-        try:
-            from .portal_hotkeys import PortalHotkeys
-            self.portal_hotkeys = PortalHotkeys(self)
-            self.portal_hotkeys.activated.connect(self.portal_action)
-            self.portal_hotkeys.error.connect(lambda msg: self.status.setText(msg))
-            self.portal_hotkeys.bound.connect(lambda: self.status.setText('Globální zkratky jsou aktivní.'))
-            self.portal_hotkeys.start()
-        except ImportError as exc: QMessageBox.warning(self, 'Zkratky', str(exc))
+        self.apply_linux_hotkeys()
     def portal_action(self, action):
         if self.shortcut_backend.currentIndex() == 1:
             self.obs_action(action)
@@ -776,41 +917,49 @@ class Window(QMainWindow):
         worker.finished.connect(finished)
         worker.start()
     def choose_audio_sources(self):
-        try: sources = audio_sources()
-        except Exception as exc:
-            QMessageBox.warning(self, 'Zvukové zdroje', str(exc)); return
-        dialog = QDialog(self); dialog.setWindowTitle('Zvukové zdroje'); dialog.resize(520, 560)
-        layout = QVBoxLayout(dialog); layout.setContentsMargins(20, 18, 20, 16); layout.setSpacing(12)
-        heading = QLabel('Vyber zvukové zdroje'); heading.setStyleSheet('font-size:19px;font-weight:700;color:#f4f6fb;'); layout.addWidget(heading)
-        intro = QLabel('Clipper nahrává vybrané vstupy do samostatných stop. Můžeš zvolit více zařízení.'); intro.setWordWrap(True); intro.setStyleSheet('color:#9da8ba;'); layout.addWidget(intro)
-        current = {value.strip() for value in self.audio_device.text().split(';') if value.strip()}
-        checks = {}
-        content = QWidget(); choices = QVBoxLayout(content); choices.setContentsMargins(4, 4, 4, 4); choices.setSpacing(5)
-        for source in sources:
-            checkbox = QCheckBox(source); checkbox.setChecked(source in current); checkbox.setMinimumHeight(34); choices.addWidget(checkbox); checks[source] = checkbox
-        if not checks:
-            none = QLabel('Nebyly nalezeny žádné zdroje. Zkontroluj PulseAudio nebo PipeWire.'); none.setWordWrap(True); none.setStyleSheet('color:#9da8ba;padding:12px;'); choices.addWidget(none)
-        choices.addStretch(1)
-        scroll = QScrollArea(); scroll.setWidgetResizable(True); scroll.setWidget(content); layout.addWidget(scroll, 1)
-        select_row = QHBoxLayout(); layout.addLayout(select_row)
-        select_row.addWidget(QLabel(f'Nalezeno zdrojů: {len(checks)}')); select_row.addStretch(1)
-        all_button = QPushButton('Vybrat vše'); all_button.clicked.connect(lambda: [box.setChecked(True) for box in checks.values()]); select_row.addWidget(all_button)
-        clear_button = QPushButton('Vymazat výběr'); clear_button.clicked.connect(lambda: [box.setChecked(False) for box in checks.values()]); select_row.addWidget(clear_button)
-        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
-        buttons.button(QDialogButtonBox.StandardButton.Ok).setText('Použít výběr')
-        buttons.accepted.connect(dialog.accept); buttons.rejected.connect(dialog.reject); layout.addWidget(buttons)
-        if dialog.exec() == QDialog.DialogCode.Accepted:
-            self.audio_device.setText('; '.join(name for name, box in checks.items() if box.isChecked()))
+        def loaded(sources):
+            payload = json.loads(sources); self.audio_tracks_editor.set_devices(payload)
+            self.status.setText(f'Načteno {len(payload)} zvukových zdrojů.')
+        def failed(message): self.status.setText('Zvuková zařízení se nepodařilo načíst: ' + message)
+        self.start_job(lambda: json.dumps(audio_sources()), on_done=loaded, on_error=failed)
+    def save_recording_settings(self, *_):
+        if self.quitting or not hasattr(self, 'audio_tracks_editor'): return
+        tracks = self.audio_tracks_editor.values()
+        self.library.set_setting('gsr_audio_tracks', json.dumps(tracks, ensure_ascii=False))
+        self.library.set_setting('seconds', str(self.seconds.value()))
+        self.library.set_setting('fps', str(self.fps.value()))
+        self.library.set_setting('audio_device', '; '.join(track['device'] for track in tracks))
+        for key, value in [('display', self.display.currentText()), ('codec', self.codec.currentText()),
+                ('format', self.format.currentText()), ('quality', self.quality.currentData()),
+                ('resolution', self.resolution.text().strip())]: self.library.set_setting(key, value)
+    def recording_setting_changed(self, *_):
+        self.save_recording_settings()
+        self.gsr_save_button.setText(f'Uložit posledních {self.seconds.value()} s')
+        bitrate = {'medium': 8, 'high': 18, 'very_high': 26, 'ultra': 40}.get(self.quality.currentData(), 18)
+        self.quality_estimate.setText(f'Odhad velikosti klipu: přibližně {self.seconds.value() * bitrate / 8:.0f} MB (pouze orientačně)')
+        if hasattr(self, 'save_recording_button'):
+            self.save_recording_button.setVisible(self.recorder.running)
+            if self.recorder.running:
+                self.gsr_state_label.setStyleSheet('color:#ffd700;font-family:monospace;')
+                self.gsr_state_label.setText('Nastavení změněno · pro použití restartuj buffer')
+    def restart_gsr(self): self.gsr_action('restart')
+    def set_gsr_ui_state(self, running, message=None):
+        if not hasattr(self, 'gsr_start_button'): return
+        self.gsr_start_button.setEnabled(not running); self.gsr_save_button.setEnabled(running); self.gsr_stop_button.setEnabled(running)
+        self.gsr_state_label.setStyleSheet('color:#51ff00;font-family:monospace;' if running else 'color:#aaaaaa;font-family:monospace;')
+        self.gsr_state_label.setText(message or ('Replay buffer běží' if running else 'Buffer zastaven'))
+        self.gsr_save_button.setText(f'Uložit posledních {self.seconds.value()} s')
+        if not running and hasattr(self, 'save_recording_button'): self.save_recording_button.hide()
     def gsr_action(self, operation):
-        if operation == 'start':
+        if operation in ('start', 'restart'):
             if not self.folder:
-                QMessageBox.warning(self, 'Nahrávání', 'Nejprve vyber složku klipů.'); return
-            self.library.set_setting('seconds', str(self.seconds.value()))
-            self.library.set_setting('fps', str(self.fps.value()))
-            self.library.set_setting('audio_device', self.audio_device.text())
-            for key, value in [('display', self.display.currentText()), ('codec', self.codec.currentText()), ('format', self.format.currentText()), ('quality', self.quality.currentText()), ('resolution', self.resolution.text().strip())]: self.library.set_setting(key, value)
-            settings = CaptureSettings(self.folder, self.display.currentText(), self.seconds.value(), self.fps.value(), self.codec.currentText(), self.format.currentText(), self.quality.currentText(), self.resolution.text().strip(), self.audio_device.text().split(';'))
+                QMessageBox.warning(self, 'Nahrávání', 'Nejprve vyber složku klipů.'); return None
+            self.save_recording_settings()
+            tracks = [RecordingAudioTrack(**item) for item in self.audio_tracks_editor.values()]
+            settings = CaptureSettings(self.folder, self.display.currentText(), self.seconds.value(), self.fps.value(),
+                self.codec.currentText(), self.format.currentText(), self.quality.currentData(), self.resolution.text().strip(), audio_tracks=tracks)
             def action():
+                if operation == 'restart': self.recorder.stop()
                 self.recorder.start(settings); return 'Replay buffer spuštěn'
         elif operation == 'stop':
             def action():
@@ -819,14 +968,11 @@ class Window(QMainWindow):
             def action():
                 self.recorder.save(); return 'Požadavek na uložení klipu odeslán'
         def completed(message):
-            running = operation != 'stop'
-            if operation == 'start': running = True
-            if operation == 'stop': running = False
-            self.gsr_state_label.setText('Replay buffer běží' if running else 'Buffer zastaven')
-            self.gsr_start_button.setEnabled(not running); self.gsr_save_button.setEnabled(running); self.gsr_stop_button.setEnabled(running)
+            self.set_gsr_ui_state(operation != 'stop')
+            if operation in ('start', 'restart'): self.save_recording_button.hide()
             self.job_done(message)
         def failed(message):
-            if operation == 'start': self.gsr_state_label.setText('Buffer se nepodařilo spustit')
+            self.set_gsr_ui_state(self.recorder.running, 'Buffer se nepodařilo spustit' if operation in ('start', 'restart') and not self.recorder.running else None)
             self.job_error(message)
         return self.start_job(action, capture=True, on_done=completed, on_error=failed)
     def show_obs_preview(self):
@@ -875,7 +1021,7 @@ class Window(QMainWindow):
         content_layout.addStretch(1); scroll.setWidget(content); outer.addWidget(scroll, 1)
         values = {}
         for key, label, low, high, default in [('width', 'Šířka', 16, 4096, 1920), ('height', 'Výška', 16, 4096, 1080), ('fps', 'FPS', 1, 240, 60), ('seconds', 'Délka replay bufferu (s)', 1, 3600, 60)]:
-            spin = QSpinBox(); spin.setRange(low, high); spin.setValue(int(self.library.setting('obs_'+key, str(default))))
+            spin = QSpinBox(); spin.setRange(low, high); spin.setValue(saved_int(self.library, 'obs_'+key, default, low, high))
             values[key] = spin; form.addRow(label, spin)
         source = QComboBox(); source.addItem('Obrazovka', 'display'); source.addItem('Hra na celé obrazovce', 'game')
         source.setCurrentIndex(max(0, source.findData(self.library.setting('obs_capture_mode', 'display')))); form.addRow('Zdroj obrazu', source)
@@ -886,8 +1032,8 @@ class Window(QMainWindow):
         quality = QComboBox(); quality.addItem('Vysoká', 'HQ'); quality.addItem('Menší soubor', 'Small'); quality.setCurrentIndex(max(0, quality.findData(self.library.setting('obs_quality', 'HQ')))); form.addRow('Kvalita', quality)
         desktop = QCheckBox('Nahrávat výchozí zvuk počítače'); desktop.setChecked(self.library.setting('obs_desktop', '1') == '1'); audio_form.addRow(desktop)
         mic = QCheckBox('Nahrávat výchozí mikrofon'); mic.setChecked(self.library.setting('obs_mic', '1') == '1'); audio_form.addRow(mic)
-        desktop_gain = QSpinBox(); desktop_gain.setRange(0, 200); desktop_gain.setSuffix(' %'); desktop_gain.setValue(int(self.library.setting('obs_desktop_gain', '100'))); audio_form.addRow('Hlasitost počítače', desktop_gain)
-        mic_gain = QSpinBox(); mic_gain.setRange(0, 200); mic_gain.setSuffix(' %'); mic_gain.setValue(int(self.library.setting('obs_mic_gain', '100'))); audio_form.addRow('Hlasitost mikrofonu', mic_gain)
+        desktop_gain = QSpinBox(); desktop_gain.setRange(0, 200); desktop_gain.setSuffix(' %'); desktop_gain.setValue(saved_int(self.library, 'obs_desktop_gain', 100, 0, 200)); audio_form.addRow('Hlasitost počítače', desktop_gain)
+        mic_gain = QSpinBox(); mic_gain.setRange(0, 200); mic_gain.setSuffix(' %'); mic_gain.setValue(saved_int(self.library, 'obs_mic_gain', 100, 0, 200)); audio_form.addRow('Hlasitost mikrofonu', mic_gain)
         from .audio_sources_ui import ExtraAudioEditor
         try:
             saved_extra = json.loads(self.library.setting('obs_extra_audio', '[]'))
@@ -942,6 +1088,17 @@ class Window(QMainWindow):
             self.job_done(message)
         self.start_job(action, capture=True, on_done=configured)
     def obs_action(self, operation):
+        if operation == 'save' and self.capture_thread and self.capture_thread.isRunning():
+            if self.obs_pending_saves >= 5:
+                message = 'Fronta ukládání OBS je plná; tento požadavek nebyl proveden.'
+                self.status.setText(message)
+                if self.tray: self.tray.showMessage('Clipper — požadavek neproveden', message, QSystemTrayIcon.MessageIcon.Warning)
+                return False
+            self.obs_pending_saves += 1
+            message = f'Další klip čeká ve frontě ({self.obs_pending_saves}). Uloží se po dokončení aktuálního ukládání.'
+            self.status.setText(message)
+            if self.tray: self.tray.showMessage('Clipper', message)
+            return True
         url, password = self.obs_url.text().strip(), self.obs_password.text()
         clips_folder = self.folder
         auto_launch = sys.platform == 'win32' and self.auto_obs.isChecked() and operation in ('start', 'toggle')
@@ -973,14 +1130,17 @@ class Window(QMainWindow):
                 self.read_obs_provenance(save_metadata['path'], saved_track_names, url, password, clips_folder)
                 if hasattr(self, 'obs_state_label'): self.obs_state_label.setText('Klip uložen · buffer běží')
                 self.status.setText('Dokončuji uložený klip…')
+                self.continue_obs_saves()
                 return
             if 'active' in save_metadata: self.set_obs_expected(save_metadata['active'], (url, password))
             if operation == 'save' and hasattr(self, 'obs_state_label'): self.obs_state_label.setText('Klip uložen · buffer běží')
             self.job_done(message)
+            if operation == 'save': self.continue_obs_saves()
         def failed(message):
             if hasattr(self, 'obs_state_label'):
                 self.obs_state_label.setText('OBS se nepodařilo připojit')
             self.job_error(message)
+            if operation == 'save': self.continue_obs_saves()
         previous_state = self.obs_state_label.text() if hasattr(self, 'obs_state_label') else None
         if previous_state is not None: self.obs_state_label.setText('Připojuji se k OBS…')
         started = self.start_job(action, capture=True, on_done=finished, on_error=failed)
@@ -988,6 +1148,11 @@ class Window(QMainWindow):
             self.obs_generation += 1
         elif not started and previous_state is not None:
             self.obs_state_label.setText(previous_state)
+    def continue_obs_saves(self):
+        if self.obs_pending_saves:
+            self.obs_pending_saves -= 1
+            QTimer.singleShot(0, lambda: self.obs_action('save'))
+        if self.quitting: QTimer.singleShot(0, self.close)
     def read_obs_provenance(self, path, names, url, password, clips_folder=''):
         """Finish naming and check optional metadata without blocking the next save."""
         self.obs_finalizing_paths.add(str(Path(path).resolve()))
@@ -1044,9 +1209,30 @@ class Window(QMainWindow):
         try:
             imported, missing = import_legacy(self.library, path, self.folder)
             scale = valid_scale(self.library.setting('ui_scale', '1')) or 1
-            self.ui_scale.setValue(round(scale * 100))
-            self.refresh(); QMessageBox.information(self, 'Import dokončen', f'Načteno klipů: {imported}. Nenalezeno souborů: {missing}. Změna měřítka se projeví po restartu aplikace.')
+            self.ui_scale.setValue(round(scale * 100)); self.apply_imported_recording_settings()
+            self.refresh(); QMessageBox.information(self, 'Import dokončen', f'Načteno klipů: {imported}. Nenalezeno souborů: {missing}. Měřítko a geometrie se použijí po restartu aplikace.')
         except Exception as exc: QMessageBox.warning(self, 'Import selhal', str(exc))
+    def apply_imported_recording_settings(self):
+        if hasattr(self, 'save_key'): self.save_key.setText(self.library.setting('save_key', 'F10'))
+        if hasattr(self, 'toggle_key'): self.toggle_key.setText(self.library.setting('toggle_key', 'F9'))
+        if hasattr(self, 'auto_buffer'): self.auto_buffer.setChecked(self.library.setting('auto_buffer') == '1')
+        if hasattr(self, 'linux_auto'): self.linux_auto.setChecked(self.library.setting('linux_auto') == '1')
+        if not hasattr(self, 'audio_tracks_editor'): return
+        if self.library.setting('display_index'):
+            self.display.setCurrentIndex(saved_int(self.library, 'display_index', 0, 0, max(0, self.display.count()-1)))
+        elif self.library.setting('display'): self.display.setCurrentText(self.library.setting('display'))
+        self.seconds.setValue(saved_int(self.library, 'seconds', 60)); self.fps.setValue(saved_int(self.library, 'fps', 60))
+        self.codec.setCurrentText(self.library.setting('codec', 'h264')); self.format.setCurrentText(self.library.setting('format', 'mkv'))
+        self.quality.setCurrentIndex(max(0, self.quality.findData(self.library.setting('quality', 'high'))))
+        self.resolution.setText(self.library.setting('resolution'))
+        try: tracks = json.loads(self.library.setting('gsr_audio_tracks', '[]'))
+        except (TypeError, ValueError): tracks = []
+        if isinstance(tracks, list) and tracks:
+            self.audio_tracks_editor.blockSignals(True)
+            for row in list(self.audio_tracks_editor.rows): self.audio_tracks_editor.remove_track(row)
+            for track in tracks:
+                if isinstance(track, dict): self.audio_tracks_editor.add_track(track)
+            self.audio_tracks_editor.blockSignals(False); self.save_recording_settings()
     def choose_folder(self):
         folder = QFileDialog.getExistingDirectory(self, 'Složka klipů', self.folder)
         if folder:
@@ -1056,6 +1242,9 @@ class Window(QMainWindow):
             self.library.set_setting('folder', folder); self.refresh()
             if hasattr(self, 'folder_hint'): self.folder_hint.setText('Ukládání do\n' + folder)
             if hasattr(self, 'settings_folder'): self.settings_folder.setText(folder)
+    def focus_library_search(self):
+        self.tabs.setCurrentIndex(1)  # Nahrávání, Knihovna, Nastavení na všech platformách
+        self.search.setFocus(); self.search.selectAll()
     def search_changed(self, _query=None):
         self.current_page = 0
         self.refresh()
@@ -1116,14 +1305,16 @@ class Window(QMainWindow):
         first, last = self.current_page * self.page_size, min(total, (self.current_page + 1) * self.page_size)
         for index in range(total):
             self.list.item(index).setHidden(index < first or index >= last)
-        self.library_count.setText(f'{total} klipů' if total != 1 else '1 klip')
+        self.library_count.setText(f'{first + 1}–{last} z {total} klipů' if total else '0 klipů')
         self.page_prev.setEnabled(self.current_page > 0); self.page_next.setEnabled(self.current_page + 1 < pages)
-        timestamps = []
-        for index in range(first, last):
-            value = self.list.item(index).data(Qt.ItemDataRole.UserRole)
-            try: timestamps.append(datetime.fromtimestamp(Path(value).stat().st_mtime))
-            except (OSError, TypeError, ValueError): pass
-        self.library_dates.setText('  ·  '.join((timestamps[0].strftime('%d.%m.%Y'), timestamps[-1].strftime('%d.%m.%Y'))) if timestamps else '')
+        dates = [clip_date(self.list.item(index).data(Qt.ItemDataRole.UserRole)) for index in range(first, last)]
+        dates = [value for value in dates if value != datetime.min.date()]
+        if dates:
+            newest, oldest = max(dates).strftime('%d.%m.%Y'), min(dates).strftime('%d.%m.%Y')
+            self.library_dates.setText(newest if newest == oldest else f'{newest} – {oldest}')
+            self.calendar_icon.show()
+        else:
+            self.library_dates.setText(''); self.calendar_icon.hide()
     def change_page(self, amount):
         self.gallery_preview.stop()
         pages = max(1, (self.list.count() + self.page_size - 1) // self.page_size)
@@ -1153,12 +1344,9 @@ class Window(QMainWindow):
         super().resizeEvent(event)
         if hasattr(self, 'library_dates'):
             self.library_dates.setVisible(event.size().width() >= 1000)
+            self.calendar_icon.setVisible(event.size().width() >= 1000 and bool(self.library_dates.text()))
             self.search.setFixedWidth(150 if event.size().width() < 900 else 210)
         if hasattr(self, 'list'): QTimer.singleShot(0, self.update_grid_size)
-    def open_card_on_click(self, item):
-        # A single click selects and reveals the details/actions pane; opening the
-        # editor is explicit through the button, context menu, or double click.
-        return
     def selection_details_changed(self):
         selected = self.list.selectedItems()
         if not selected:
@@ -1216,7 +1404,7 @@ class Window(QMainWindow):
         self.detail_tags.setText('🏷  ' + ('   ·   '.join(tags) if tags else 'Bez tagů'))
         image = self.thumbnails.request(path)
         if image and image.is_file():
-            self.detail_thumbnail.setPixmap(QPixmap(str(image)).scaled(self.detail_thumbnail.size(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)); self.detail_thumbnail.setText('')
+            self.detail_thumbnail.setPixmap(QPixmap(str(image))); self.detail_thumbnail.setText('')
         else:
             self.detail_thumbnail.setPixmap(QPixmap())
             self.detail_thumbnail.setText('Náhled není dostupný' if self.thumbnails.unavailable(path) else 'Náhled se připravuje…' if path.is_file() else 'Soubor už není dostupný')
@@ -1226,7 +1414,7 @@ class Window(QMainWindow):
             if item.data(Qt.ItemDataRole.UserRole) == path:
                 item.setData(Qt.ItemDataRole.UserRole + 4, image); item.setData(Qt.ItemDataRole.UserRole + 5, False); self.list.viewport().update(self.list.visualItemRect(item))
         if getattr(self, 'detail_path', None) and str(self.detail_path) == path:
-            self.detail_thumbnail.setPixmap(QPixmap(image).scaled(self.detail_thumbnail.size(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)); self.detail_thumbnail.setText('')
+            self.detail_thumbnail.setPixmap(QPixmap(image)); self.detail_thumbnail.setText('')
     def thumbnail_failed(self, path):
         for index in range(self.list.count()):
             item = self.list.item(index)
@@ -1307,7 +1495,7 @@ class Window(QMainWindow):
     def open_version(self, path):
         index = self.detail_version.findData(str(path))
         if index >= 0: self.detail_version.setCurrentIndex(index)
-        self.open_editor()
+        self.open_editor(preview_mode=self.detail_version.currentData(Qt.ItemDataRole.UserRole + 1) == 'export')
     def delete_version(self, path, required_trims=None):
         path = Path(path)
         if QMessageBox.question(self, 'Smazat verzi klipu', f'Smazat soubor {path.name}?') != QMessageBox.StandardButton.Yes: return
@@ -1320,7 +1508,21 @@ class Window(QMainWindow):
         except OSError as exc: QMessageBox.warning(self, 'Mazání se nezdařilo', str(exc))
     def open_location(self):
         selected = self.selected(); paths = [selected] if selected else self.selected_paths()
-        if paths: QDesktopServices.openUrl(QUrl.fromLocalFile(str(paths[0].parent)))
+        if not paths: return
+        try:
+            if sys.platform == 'win32':
+                subprocess.Popen(['explorer', '/select,', str(paths[0])])
+            elif sys.platform == 'darwin':
+                subprocess.Popen(['open', '-R', str(paths[0])])
+            elif sys.platform.startswith('linux'):
+                subprocess.Popen(['dbus-send', '--session', '--print-reply', '--dest=org.freedesktop.FileManager1',
+                    '/org/freedesktop/FileManager1', 'org.freedesktop.FileManager1.ShowItems',
+                    'array:string:' + ','.join(QUrl.fromLocalFile(str(path)).toString() for path in paths), 'string:'],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            else:
+                QDesktopServices.openUrl(QUrl.fromLocalFile(str(paths[0].parent)))
+        except OSError:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(paths[0].parent)))
     def copy_files(self):
         mime = QMimeData(); mime.setUrls([QUrl.fromLocalFile(str(path)) for path in self.selected_paths()])
         QApplication.clipboard().setMimeData(mime)
@@ -1329,7 +1531,9 @@ class Window(QMainWindow):
         paths = set()
         for item in self.list.selectedItems():
             exports = (item.data(Qt.ItemDataRole.UserRole + 2) or {}).get('export', [])
-            if exports: paths.add(Path(exports[-1]))
+            if exports:
+                current = getattr(self, 'detail_path', None)
+                paths.add(current if current and str(current) in exports else Path(exports[0]))
         return sorted(paths)
     def selected_version_paths(self, kind, require_trim=False):
         paths = set()
@@ -1393,14 +1597,14 @@ class Window(QMainWindow):
             try: callback(path, json.loads(payload))
             except Exception as exc: QMessageBox.warning(self, 'Video', str(exc))
         self.start_job(lambda: json.dumps(probe(path)), on_done=loaded)
-    def open_editor(self):
-        self.probe_selected(self.show_editor)
-    def show_editor(self, path, info, autoplay=False):
+    def open_editor(self, preview_mode=False):
+        self.probe_selected(lambda path, info: self.show_editor(path, info, autoplay=True, preview_mode=preview_mode))
+    def show_editor(self, path, info, autoplay=False, preview_mode=False):
         if self.active_editor is not None: return
         self.gallery_preview.stop()
         try:
             from .editor import Editor
-            editor = Editor(path, self, info=info)
+            editor = Editor(path, self, info=info, preview_mode=preview_mode)
             editor.setWindowFlags(Qt.WindowType.Widget)
             self.active_editor = editor
             self.root_layout.insertWidget(0, editor, 1)
@@ -1424,11 +1628,14 @@ class Window(QMainWindow):
         start, end, volumes, mix_first = values
         is_export = operation == 'export'; size = 10.0
         if is_export:
-            size, ok = QInputDialog.getDouble(self, 'Export', 'Maximální velikost v MB:', 10, .1, 10000, 1)
+            try: size = max(.1, min(10000., float(self.library.setting('export_size', '10'))))
+            except (TypeError, ValueError): size = 10.
+            size, ok = QInputDialog.getDouble(self, 'Export', 'Maximální velikost v MB:', size, .1, 10000, 1)
             if not ok: return
+            self.library.set_setting('export_size', str(size))
         name = path.stem
         for suffix in ('_trim', '_export'):
-            if name.endswith(suffix): name = name[:-len(suffix)]
+            if name.casefold().endswith(suffix): name = name[:-len(suffix)]
         dest, _ = QFileDialog.getSaveFileName(self, 'Uložit jako', str(path.with_name(name + ('_export.mp4' if is_export else '_trim.mp4'))))
         if not dest: return
         if is_export:
@@ -1491,30 +1698,47 @@ class Window(QMainWindow):
         range_group = QGroupBox('Rozsah klipu'); range_form = QFormLayout(range_group); content_layout.addWidget(range_group)
         start, end, size = QDoubleSpinBox(), QDoubleSpinBox(), QDoubleSpinBox()
         for spin in (start, end): spin.setRange(0, length); spin.setDecimals(2); spin.setSingleStep(.1); spin.setSuffix(' s'); spin.setMinimumHeight(38)
-        end.setValue(length); size.setRange(0.1, 10000); size.setValue(10); size.setSuffix(' MB')
+        saved = self.library.edit_for(p)
+        try:
+            saved_start = float(saved.get('in', 0)) * length
+            saved_end = float(saved.get('out', 1)) * length
+            if not (0 <= saved_start < saved_end <= length + .05):
+                saved_start, saved_end = 0., length
+        except (TypeError, ValueError):
+            saved_start, saved_end = 0., length
+        start.setValue(saved_start)
+        end.setValue(saved_end); size.setRange(0.1, 10000); size.setSuffix(' MB')
+        try: size.setValue(float(self.library.setting('export_size', '10')))
+        except (TypeError, ValueError): size.setValue(10)
         range_form.addRow('Začátek', start); range_form.addRow('Konec', end)
         if is_export:
             size.setMinimumHeight(38); range_form.addRow('Cílová maximální velikost', size)
-            size_help = QLabel('Výsledný soubor se přizpůsobí limitu, například 10 MB pro Discord.'); size_help.setWordWrap(True); size_help.setStyleSheet('color:#9da8ba;'); range_form.addRow(size_help)
+            size_help = QLabel('Výsledný soubor se přizpůsobí limitu, například 10 MB pro Discord.'); size_help.setWordWrap(True); size_help.setProperty('muted', True); range_form.addRow(size_help)
+            preset_row = QHBoxLayout()
+            for value in (10, 20, 50):
+                preset = QPushButton(f'{value} MB'); preset.clicked.connect(lambda checked=False, amount=value: size.setValue(amount)); preset_row.addWidget(preset)
+            preset_row.addStretch(1); range_form.addRow('Rychlá volba', preset_row)
         else:
             note = QLabel('Uloží se samostatný oříznutý soubor ve stejné kvalitě; originál zůstane nedotčený.')
             note.setWordWrap(True); note.setStyleSheet('color:#9da8ba;'); range_form.addRow(note)
         audio = {}
-        saved_names = self.library.edit_for(p).get('track_names', [])
+        saved_names = saved.get('track_names', [])
         if not isinstance(saved_names, list): saved_names = []
         saved_names = [name if isinstance(name, str) else '' for name in saved_names]
         audio_group = QGroupBox('Hlasitost zvukových stop'); audio_form = QFormLayout(audio_group); content_layout.addWidget(audio_group)
         for stream in info['streams']:
             if stream.get('codec_type') != 'audio': continue
             index = stream['index']
-            volume = QDoubleSpinBox(); volume.setRange(0, 4); volume.setSingleStep(.1); volume.setValue(1); volume.setSuffix('×'); volume.setMinimumHeight(36)
+            volume = QDoubleSpinBox(); volume.setRange(0, 4); volume.setSingleStep(.1); volume.setSuffix('×'); volume.setMinimumHeight(36)
+            try: volume.setValue(max(0., min(4., float(saved.get('volumes', {}).get(str(index), 1)))))
+            except (TypeError, ValueError): volume.setValue(1)
             title = (saved_names[len(audio)] if len(audio) < len(saved_names) else '') or stream.get('tags', {}).get('title') or stream.get('tags', {}).get('name') or f'Stopa {index}'
             audio_form.addRow(f'{title}  ·  {stream.get("codec_name", "audio")}', volume)
             audio[index] = volume
         if not audio:
             audio_group.hide()
         mix_first = QCheckBox('První stopa je mix ostatních stop')
-        saved_mix = self.library.edit_for(p).get('mix_first', first_track_is_named_mix(info))
+        saved_mix = saved.get('mix_first', first_track_is_named_mix(info))
         mix_first.setChecked(bool(saved_mix))
         if len(audio) > 1:
             mix_first.setToolTip('Použij, pokud první stopa již obsahuje smíchaný zvuk ostatních stop.')
@@ -1545,6 +1769,7 @@ class Window(QMainWindow):
         args = self.selection(is_export, path, info)
         if not args: return
         if is_export:
+            self.library.set_setting('export_size', str(args[4]))
             self.start_media_job(lambda progress, cancel: export(*args[:5], volumes=args[5], progress=progress, cancellation=cancel), args[0], args[1], kind='export')
         else:
             self.start_media_job(lambda progress, cancel: trim(*args[:4], volumes=args[5], mix_first=args[6], progress=progress, cancellation=cancel), args[0], args[1], mix_first=args[6])
@@ -1611,16 +1836,34 @@ class Window(QMainWindow):
         if self.tray and message.startswith('Klip uložen:'): self.tray.showMessage('Clipper', message)
     def job_error(self, message):
         self.status.setText('Operace selhala: ' + message)
+        if self.quitting: return
         if self.tray and not self.isVisible(): self.tray.showMessage('Clipper — chyba', message[:200], QSystemTrayIcon.MessageIcon.Warning)
         else: QMessageBox.warning(self, 'Chyba', message)
     def closeEvent(self, event):
         if self.tray and self.tray.isVisible() and not self.quitting:
             self.hide(); event.ignore(); return
-        if any(thread is not None for thread in (self.thread, self.capture_thread)):
-            QMessageBox.information(self, 'Práce probíhá', 'Počkej na dokončení zpracování.'); event.ignore(); return
+        jobs = [thread for thread in (self.thread, self.capture_thread) if thread is not None]
+        if jobs:
+            self.quitting = True; self.status.setText('Před ukončením čekám na dokončení aktuální operace…')
+            if not self.closing_after_jobs:
+                self.closing_after_jobs = True
+                for thread in jobs: thread.finished.connect(self.close)
+            event.ignore(); return
+        if self.obs_pending_saves:
+            self.quitting = True; self.status.setText('Čekám na dokončení fronty uložených klipů…')
+            event.ignore(); return
         if self.obs_metadata_jobs:
             self.quitting = True
             self.status.setText('Čekám na dokončení kontroly údajů klipů…'); event.ignore(); return
+        if sys.platform.startswith('linux') and self.recorder.pending_saves and not self.gsr_save_abandoned:
+            self.quitting = True
+            if self.gsr_save_close_deadline is not None and time.monotonic() >= self.gsr_save_close_deadline:
+                self.gsr_save_abandoned = True
+                QMessageBox.warning(self, 'Ukládání klipu', 'Rekordér nedokončil uložení včas. Poslední klip se nemusel uložit.')
+            else:
+                if self.gsr_save_close_deadline is None: self.gsr_save_close_deadline = time.monotonic() + 15
+                self.status.setText('Před ukončením čekám na dokončení ukládání klipu…')
+                QTimer.singleShot(300, self.close); event.ignore(); return
         self.preview_timer.stop()
         self.obs_health_timer.stop()
         if self.obs_preview_worker and self.obs_preview_worker.isRunning():
@@ -1639,19 +1882,22 @@ class Window(QMainWindow):
                 self.closing_after_health = True
                 self.obs_health_thread.finished.connect(self.close)
             self.status.setText('Čekám na ukončení kontroly OBS…'); event.ignore(); return
-        self.recorder.stop()
+        try: self.recorder.stop()
+        except Exception as exc: self.status.setText('Rekordér se nepodařilo korektně ukončit: ' + str(exc))
+        self.gsr_save_close_deadline = None
         self.stop_hotkeys()
-        if self.portal_hotkeys:
-            self.portal_hotkeys.requestInterruption()
-            if not self.portal_hotkeys.wait(7000):
-                self.status.setText('Čekám na ukončení systémových zkratek.'); event.ignore(); return
+        if not self.stop_portal_hotkeys() or not self.stop_evdev_hotkeys():
+            self.status.setText('Čekám na ukončení systémových zkratek.'); event.ignore(); return
         if self.active_editor is not None:
             self.active_editor.reject()
         self.gallery_preview.stop()
         self.record_timer.stop(); self.refresh_timer.stop()
         if self.tray: self.tray.hide()
         self.thumbnails.shutdown()
+        self.library.set_setting('window_geometry', bytes(self.saveGeometry().toHex()).decode('ascii'))
+        self.library.set_setting('window_maximized', '1' if self.isMaximized() else '0')
         self.library.close(); event.accept()
+        if self._restart_pending: QTimer.singleShot(0, self.launch_replacement)
 
 def main():
     apply_saved_scale()

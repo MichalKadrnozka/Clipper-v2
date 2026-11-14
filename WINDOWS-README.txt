@@ -1,4 +1,4 @@
-CLIPPER – vývojové sestavení pro Windows
+CLIPPER pro Windows
 
 Spusťte Clipper.exe. Celou složku včetně adresáře _internal ponechte pohromadě.
 V záložce Knihovna vyberte složku klipů. Nahrávání vyžaduje samostatně

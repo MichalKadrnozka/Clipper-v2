@@ -1,9 +1,42 @@
 """Persistent clip metadata and non-destructive folder discovery."""
 from pathlib import Path
+from datetime import datetime
 import json
+import re
 import sqlite3
 
-VIDEO_EXTENSIONS = {'.mp4', '.mkv', '.mov', '.webm', '.avi'}
+VIDEO_EXTENSIONS = {'.mp4', '.mkv', '.mov', '.m4v', '.webm', '.avi'}
+
+
+def clip_date(path):
+    """Prefer the recording date encoded in a filename, then its mtime."""
+    name = Path(path).name
+    match = re.search(r'(\d{4})[-_.](\d{2})[-_.](\d{2})', name)
+    if match:
+        year, month, day = map(int, match.groups())
+    else:
+        match = re.search(r'(?<!\d)(\d{2})[-_.](\d{2})[-_.](\d{4})(?!\d)', name)
+        if match:
+            day, month, year = map(int, match.groups())
+        else:
+            match = re.search(r'from\s*([a-zA-Z]{3})\s*(\d{1,2}).*?(20\d{2})', name, re.IGNORECASE)
+            if match:
+                months = {'jan': 1, 'feb': 2, 'mar': 3, 'apr': 4, 'may': 5, 'jun': 6,
+                          'jul': 7, 'aug': 8, 'sep': 9, 'oct': 10, 'nov': 11, 'dec': 12}
+                year, day = int(match.group(3)), int(match.group(2))
+                month = months.get(match.group(1).casefold()[:3])
+            else:
+                year = month = day = None
+    try:
+        if year and month and day:
+            return datetime(year, month, day).date()
+    except ValueError:
+        pass
+    try:
+        return datetime.fromtimestamp(Path(path).stat().st_mtime).date()
+    except OSError:
+        return datetime.min.date()
+
 
 class Library:
     def __init__(self, database):
@@ -113,13 +146,13 @@ class Library:
             for path in folder.iterdir():
                 try:
                     if path.is_file() and path.suffix.casefold() in VIDEO_EXTENSIONS:
-                        entries.append((path.stat().st_mtime_ns, path))
+                        entries.append((clip_date(path), path.stat().st_mtime_ns, path.name.casefold(), path))
                 except OSError:
                     continue  # A recorder or another app may remove a file during discovery.
         except OSError:
             return []
-        entries.sort(key=lambda entry: entry[0], reverse=True)
-        return [p for _, p in entries if not query or query in p.name.casefold() or any(query in t.casefold() for t in self.tags_for(p))]
+        entries.sort(key=lambda entry: entry[:3], reverse=True)
+        return [entry[3] for entry in entries if not query or query in entry[3].name.casefold() or any(query in t.casefold() for t in self.tags_for(entry[3]))]
 
 def group_clips(paths, versions=None):
     """Group the legacy original / _trim / _export convention without moving files.

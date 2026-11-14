@@ -22,6 +22,15 @@ class LibraryTests(unittest.TestCase):
             self.assertEqual(db.scan(p, 'funny'), [])
             db.close()
 
+    def test_filename_dates_drive_gallery_order(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d); older = root / 'Replay 2024-01-02 game.mp4'; newer = root / 'Replay 03-05-2025 game.mp4'
+            older.touch(); newer.touch(); older.touch()
+            db = Library(root / 'library.db')
+            self.assertEqual(db.scan(root), [newer, older])
+            self.assertEqual(db.scan(root)[0].stem, 'Replay 03-05-2025 game')
+            db.close()
+
 class VersionReplacementTests(unittest.TestCase):
     def test_replacing_output_removes_stale_metadata_and_keeps_source_tags(self):
         with tempfile.TemporaryDirectory() as d:

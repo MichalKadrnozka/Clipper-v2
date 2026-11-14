@@ -109,10 +109,54 @@ def name_replay_for_active_window(path, folder):
     return name_saved_replay(path, folder, title)
 
 @dataclass(frozen=True)
+class RecordingAudioTrack:
+    """One GSR input; gain is applied later by the clip editor, not by GSR."""
+    device: str
+    name: str = ''
+    gain: float = 1.0
+
+    @classmethod
+    def from_value(cls, value):
+        if isinstance(value, cls):
+            return value
+        if isinstance(value, str):
+            return cls(value)
+        if isinstance(value, dict):
+            return cls(str(value.get('device', '')), str(value.get('name', '')), value.get('gain', 1.0))
+        raise RecorderError('Invalid audio track')
+
+
+def _recording_tracks(settings):
+    configured = settings.audio_tracks or settings.audio_devices
+    tracks = []
+    for value in configured:
+        track = RecordingAudioTrack.from_value(value)
+        device = track.device.strip()
+        if not device:
+            continue
+        try:
+            gain = float(track.gain)
+        except (TypeError, ValueError) as exc:
+            raise RecorderError('Invalid audio gain') from exc
+        if not 0 <= gain <= 1.5:
+            raise RecorderError('Audio gain must be between 0 and 150%')
+        tracks.append(RecordingAudioTrack(device, track.name.strip() or device, gain))
+    return tracks
+
+
+@dataclass(frozen=True)
 class SavedReplay:
     path: str
     first_is_mix: bool
     track_names: tuple[str, ...]
+    # Audio stream indexes, including a possible Mix at index 1, to editor gain.
+    track_volumes: dict[int, float] = field(default_factory=dict)
+
+    @property
+    def track_gains(self):
+        return tuple(self.track_volumes.get(index, 1.0)
+                     for index in range(1, len(self.track_names) + 1))
+
 
 @dataclass
 class CaptureSettings:
@@ -125,6 +169,7 @@ class CaptureSettings:
     quality: str = 'high'
     resolution: str = ''
     audio_devices: list[str] = field(default_factory=list)
+    audio_tracks: list[RecordingAudioTrack] = field(default_factory=list)
 
     def command(self, executable='gpu-screen-recorder'):
         if not Path(self.folder).is_dir(): raise RecorderError('Clip folder does not exist')
@@ -137,7 +182,8 @@ class CaptureSettings:
         if self.resolution and not __import__('re').fullmatch(r'\d{2,5}x\d{2,5}', self.resolution): raise RecorderError('Invalid resolution')
         cmd = [executable, '-w', self.display, '-c', self.container, '-f', str(self.fps), '-k', self.codec, '-r', str(self.seconds), '-o', self.folder, '-q', self.quality]
         if self.resolution: cmd += ['-s', self.resolution]
-        sources = [source.strip() for source in self.audio_devices if source.strip()]
+        tracks = _recording_tracks(self)
+        sources = [track.device for track in tracks]
         # The first track is a listening mix; individual sources remain editable.
         if len(sources) > 1: cmd += ['-a', '|'.join(sources)]
         for source in sources: cmd += ['-a', source]
@@ -148,6 +194,9 @@ class GSRRecorder:
         self.executable = executable
         self.process = None
         self.log = deque(maxlen=100)
+        self._log_lock = threading.Lock()
+        self._save_lock = threading.Lock()
+        self._pending_saves = 0
         self.reader = None
         self.saved = queue.SimpleQueue()
         self.expect_running = False
@@ -155,22 +204,37 @@ class GSRRecorder:
     @property
     def running(self):
         return self.process is not None and self.process.poll() is None
+    @property
+    def pending_saves(self):
+        with self._save_lock: return self._pending_saves
+    def log_snapshot(self):
+        with self._log_lock: return '\n'.join(self.log)
+    def _save_completed(self):
+        with self._save_lock:
+            if self._pending_saves: self._pending_saves -= 1
     def start(self, settings):
         if sys.platform != 'linux': raise RecorderError('GPU Screen Recorder is available only on Linux')
         if self.running: raise RecorderError('Replay buffer is already running')
-        self.log.clear()
+        with self._log_lock: self.log.clear()
+        with self._save_lock: self._pending_saves = 0
         try:
             self.process = subprocess.Popen(settings.command(self.executable), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding='utf-8', errors='replace', start_new_session=True, env=external_environment())
         except OSError as exc:
             raise RecorderError(f'Cannot launch GPU Screen Recorder: {exc}') from exc
         process = self.process
-        sources = tuple(source.strip() for source in settings.audio_devices if source.strip())
-        first_is_mix = len(sources) > 1
-        track_names = (('Mix',) if first_is_mix else ()) + sources
+        tracks = _recording_tracks(settings)
+        first_is_mix = len(tracks) > 1
+        track_names = (('Mix',) if first_is_mix else ()) + tuple(track.name for track in tracks)
+        track_volumes = {index: track.gain for index, track in enumerate(
+            tracks, start=2 if first_is_mix else 1)}
+        if first_is_mix:
+            track_volumes[1] = 1.0
+            track_volumes = dict(sorted(track_volumes.items()))
         def read_log():
             with process.stdout:
                 for line in process.stdout:
-                    line = line.strip(); self.log.append(line)
+                    line = line.strip()
+                    with self._log_lock: self.log.append(line)
                     candidate = line
                     for prefix in ('Saved video to ', 'Saved replay to '):
                         if line.startswith(prefix): candidate = line[len(prefix):].strip()
@@ -180,7 +244,8 @@ class GSRRecorder:
                                 candidate = name_replay_for_active_window(candidate, settings.folder)
                         except OSError:
                             pass  # Keep reporting the actual saved path if lookup fails.
-                        self.saved.put(SavedReplay(candidate, first_is_mix, track_names))
+                        self.saved.put(SavedReplay(candidate, first_is_mix, track_names, track_volumes))
+                        self._save_completed()
         self.reader = threading.Thread(target=read_log, daemon=True); self.reader.start()
         try:
             code = self.process.wait(timeout=1.0)
@@ -189,28 +254,46 @@ class GSRRecorder:
             self.first_is_mix = first_is_mix
             return
         self.reader.join(timeout=1)
-        raise RecorderError(f'GPU Screen Recorder exited ({code}):\n' + '\n'.join(self.log)[-3000:])
+        raise RecorderError(f'GPU Screen Recorder exited ({code}):\n' + self.log_snapshot()[-3000:])
     def save(self):
         if not self.running: raise RecorderError('Replay buffer is not running')
+        with self._save_lock: self._pending_saves += 1
         try: self.process.send_signal(signal.SIGUSR1)
-        except OSError as exc: raise RecorderError(str(exc)) from exc
+        except OSError as exc:
+            self._save_completed(); raise RecorderError(str(exc)) from exc
     def stop(self):
         self.expect_running = False
-        if not self.running: return
-        self.process.terminate()
-        try: self.process.wait(timeout=8)
-        except subprocess.TimeoutExpired:
-            self.process.kill(); self.process.wait(timeout=3)
-        if self.reader: self.reader.join(timeout=2)
+        error = None
+        try:
+            if self.running:
+                self.process.terminate()
+                try: self.process.wait(timeout=8)
+                except subprocess.TimeoutExpired:
+                    self.process.kill(); self.process.wait(timeout=3)
+        except OSError as exc: error = RecorderError(str(exc))
+        except subprocess.SubprocessError as exc: error = RecorderError(str(exc))
+        finally:
+            if self.reader: self.reader.join(timeout=2)
+        if error: raise error
+
+DEFAULT_AUDIO_OUTPUT = 'default_output'
+DEFAULT_AUDIO_INPUT = 'default_input'
+
+
+def default_audio_output():
+    """A safe GSR alias which follows the current PulseAudio/PipeWire output."""
+    return DEFAULT_AUDIO_OUTPUT
+
 
 def audio_sources():
-    """List PulseAudio/PipeWire source identifiers (including output monitors)."""
+    """List GSR default aliases and PulseAudio/PipeWire source identifiers."""
     try:
         result = subprocess.run(['pactl', 'list', 'short', 'sources'], capture_output=True, text=True, timeout=5, check=True, env=external_environment())
     except (OSError, subprocess.SubprocessError) as exc:
         raise RecorderError(f'Cannot list audio devices: {exc}') from exc
-    result_sources = []
+    result_sources = [DEFAULT_AUDIO_OUTPUT, DEFAULT_AUDIO_INPUT]
     for line in result.stdout.splitlines():
         columns = line.split('\t')
-        if len(columns) > 1 and columns[1]: result_sources.append(columns[1])
+        if len(columns) > 1 and columns[1] and columns[1] not in result_sources:
+            result_sources.append(columns[1])
     return result_sources

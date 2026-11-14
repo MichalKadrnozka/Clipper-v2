@@ -3,23 +3,48 @@ from __future__ import annotations
 import re
 
 MODIFIERS = {'ALT': 0x0001, 'CTRL': 0x0002, 'SHIFT': 0x0004, 'WIN': 0x0008}
+MODIFIER_ALIASES = {
+    'CONTROL': 'CTRL',
+    'META': 'WIN',
+    'SUPER': 'WIN',
+    'WINDOWS': 'WIN',
+}
+NAMED_KEYS = {
+    'PAGEUP': 0x21,       # VK_PRIOR
+    'PAGEDOWN': 0x22,     # VK_NEXT
+    'END': 0x23,
+    'HOME': 0x24,
+    'INSERT': 0x2D,
+    'DELETE': 0x2E,
+    'ESCAPE': 0x1B,
+    'ESC': 0x1B,
+    'SPACE': 0x20,
+    'SPACEBAR': 0x20,
+}
+
 
 def parse_hotkey(text):
+    """Return Windows ``MOD_NOREPEAT`` modifiers and a virtual-key code."""
+    if not isinstance(text, str):
+        raise ValueError('Use a key such as F10 or Ctrl+Shift+F10')
     tokens = [s.strip().upper() for s in text.split('+')]
     if not tokens or any(not s for s in tokens):
         raise ValueError('Use a key such as F10 or Ctrl+Shift+F10')
     modifier = 0
     for token in tokens[:-1]:
+        token = MODIFIER_ALIASES.get(token, token)
         if token not in MODIFIERS or modifier & MODIFIERS[token]:
             raise ValueError('Invalid or repeated modifier')
         modifier |= MODIFIERS[token]
     key = tokens[-1]
-    if re.fullmatch(r'F(?:[1-9]|1[0-9]|2[0-4])', key):
+    if key in NAMED_KEYS:
+        code = NAMED_KEYS[key]
+    elif re.fullmatch(r'F(?:[1-9]|1[0-9]|2[0-4])', key):
         code = 0x70 + int(key[1:]) - 1
     elif re.fullmatch(r'[A-Z0-9]', key):
         code = ord(key)
     else:
-        raise ValueError('Use a letter, digit, or F1–F24 as the key')
+        raise ValueError('Use a letter, digit, named key, or F1–F24 as the key')
     return modifier | 0x4000, code  # MOD_NOREPEAT
 
 try:

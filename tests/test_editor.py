@@ -189,6 +189,32 @@ class EditorTests(unittest.TestCase):
         self.assertAlmostEqual(positions[-1], 500, delta=15)
         slider.close()
 
+    def test_preview_timeout_finishes_instead_of_waiting_forever(self):
+        from PyQt6.QtCore import QEventLoop, QTimer
+        from clipper.proxy import PreviewProxy
+        import sys
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d)/'empty.mp4'; path.touch(); proxy = PreviewProxy(path, Path(d)/'cache')
+            proxy.watchdog.setInterval(30); errors = []; loop = QEventLoop()
+            proxy.failed.connect(lambda error: (errors.append(error), loop.quit()))
+            QTimer.singleShot(3000, loop.quit)
+            proxy.process.start(sys.executable, ['-c', 'import time; time.sleep(2)']); proxy.watchdog.start(); loop.exec(); proxy.cancel()
+            self.assertEqual(errors, ['Příprava náhledu překročila časový limit.'])
+
+    def test_proxy_handles_odd_source_dimensions(self):
+        from PyQt6.QtCore import QEventLoop, QTimer
+        from clipper.proxy import PreviewProxy
+        from clipper.media import probe
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d)/'odd.mkv'
+            run(['ffmpeg', '-v', 'error', '-f', 'lavfi', '-i', 'testsrc2=size=161x91:rate=10', '-t', '1', '-c:v', 'ffv1', str(path)])
+            proxy = PreviewProxy(path, Path(d)/'cache', duration=1); ready = []; errors = []; loop = QEventLoop()
+            proxy.ready.connect(lambda result: (ready.append(result), loop.quit())); proxy.failed.connect(lambda error: (errors.append(error), loop.quit()))
+            QTimer.singleShot(10000, loop.quit); proxy.start(); loop.exec()
+            self.assertFalse(errors, errors); self.assertTrue(ready)
+            video = next(stream for stream in probe(ready[0])['streams'] if stream['codec_type'] == 'video')
+            self.assertEqual((video['width'], video['height']), (160, 90))
+
     def test_preview_generation_reports_progress(self):
         from PyQt6.QtCore import QEventLoop, QTimer
         from clipper.proxy import PreviewProxy
@@ -225,6 +251,134 @@ class EditorTests(unittest.TestCase):
             self.assertTrue(ready)
             self.assertTrue(editor.play_button.isEnabled())
             editor.reject()
+
+    def test_export_preview_hides_trim_controls_but_keeps_seeking(self):
+        from PyQt6.QtCore import Qt, QPoint
+        from PyQt6.QtTest import QTest
+        from clipper.editor import Editor
+        info = {'streams': [{'codec_type': 'video', 'index': 0, 'duration': '4',
+                             'codec_name': 'h264', 'avg_frame_rate': '30/1'}],
+                'format': {'duration': '4'}}
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / 'preview.mp4'; path.touch()
+            editor = Editor(path, info=info, preview_mode=True)
+            self.assertIs(editor.save_trim_button, editor.save_trim)
+            self.assertTrue(editor.preview_mode)
+            self.assertTrue(editor.range_box.isHidden())
+            self.assertFalse(editor.range_box.isEnabled())
+            self.assertTrue(editor.range_summary.isHidden())
+            self.assertTrue(editor.save_trim.isHidden())
+            self.assertFalse(editor.save_trim.isEnabled())
+            self.assertTrue(editor.export_button.isHidden())
+            self.assertFalse(editor.export_button.isEnabled())
+            self.assertFalse(editor.start.isEnabled())
+            self.assertFalse(editor.end.isEnabled())
+            self.assertTrue(editor.seek.isEnabled())
+            self.assertTrue(editor.play_button.isEnabled())
+            self.assertFalse(editor.video_timeline.trim_enabled)
+            seeks = []; starts = []
+            editor.video_timeline.seekRequested.connect(seeks.append)
+            editor.video_timeline.startRequested.connect(starts.append)
+            editor.video_timeline.resize(400, 76)
+            QTest.mouseClick(editor.video_timeline, Qt.MouseButton.LeftButton, pos=QPoint(1, 40))
+            self.assertTrue(seeks)
+            self.assertFalse(starts)
+            self.assertIsNone(editor.video_timeline.dragging)
+            editor.accept_operation('export')
+            self.assertIsNone(editor.operation)
+            editor.reject()
+
+    def test_disabled_waveform_trim_handles_still_seek(self):
+        from PyQt6.QtCore import Qt, QPoint
+        from PyQt6.QtTest import QTest
+        from clipper.editor import WaveformView
+        wave = WaveformView(); wave.resize(400, 48); wave.set_trim_enabled(False)
+        seeks = []; starts = []; ends = []
+        wave.seekRequested.connect(seeks.append); wave.startRequested.connect(starts.append); wave.endRequested.connect(ends.append)
+        QTest.mouseClick(wave, Qt.MouseButton.LeftButton, pos=QPoint(1, 20))
+        self.assertTrue(seeks)
+        self.assertFalse(starts)
+        self.assertFalse(ends)
+        self.assertIsNone(wave.dragging)
+        wave.close()
+
+    def test_autoplay_seeks_to_saved_in_even_when_preview_becomes_ready_later(self):
+        from unittest.mock import patch
+        from PyQt6.QtWidgets import QWidget
+        from clipper.library import Library
+        from clipper.editor import Editor
+        info = {'streams': [{'codec_type': 'video', 'index': 0, 'duration': '4',
+                             'codec_name': 'h264', 'avg_frame_rate': '30/1'}],
+                'format': {'duration': '4'}}
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d); path = root / 'source.mp4'; path.touch()
+            parent = QWidget(); parent.library = Library(root / 'db.sqlite'); parent.data_path = root
+            parent.library.save_edit(path, {'in': .25, 'out': .75})
+            editor = Editor(path, parent, info=info)
+            editor.play_button.setEnabled(False)
+            with patch.object(editor.player, 'setPosition') as seek, patch.object(editor.player, 'play') as play:
+                editor.request_autoplay()
+                play.assert_not_called()
+                editor.preview_ready(str(path))
+                seek.assert_called_once_with(1000)
+                play.assert_called_once_with()
+            editor.reject(); parent.library.close()
+
+    def test_clicking_video_toggles_playback(self):
+        from unittest.mock import patch
+        from PyQt6.QtCore import Qt, QPoint
+        from PyQt6.QtTest import QTest
+        from clipper.editor import Editor
+        info = {'streams': [{'codec_type': 'video', 'index': 0, 'duration': '4',
+                             'codec_name': 'h264', 'avg_frame_rate': '30/1'}],
+                'format': {'duration': '4'}}
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / 'source.mp4'; path.touch()
+            editor = Editor(path, info=info)
+            editor.video.resize(320, 180); editor.show(); self.app.processEvents()
+            editor.play_button.setEnabled(True)
+            with patch.object(editor.player, 'play') as play:
+                QTest.mouseClick(editor.video, Qt.MouseButton.LeftButton, pos=QPoint(100, 80))
+                play.assert_called_once_with()
+            editor.reject()
+
+    def test_i_o_shortcuts_set_trim_points(self):
+        from unittest.mock import patch
+        from PyQt6.QtCore import Qt
+        from PyQt6.QtTest import QTest
+        from clipper.editor import Editor
+        info = {'streams': [{'codec_type': 'video', 'index': 0, 'duration': '4',
+                             'codec_name': 'h264', 'avg_frame_rate': '30/1'}],
+                'format': {'duration': '4'}}
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / 'source.mp4'; path.touch()
+            editor = Editor(path, info=info)
+            with patch.object(editor.player, 'position', return_value=1250):
+                QTest.keyClick(editor, Qt.Key.Key_I)
+            with patch.object(editor.player, 'position', return_value=2250):
+                QTest.keyClick(editor, Qt.Key.Key_O)
+            self.assertAlmostEqual(editor.start.value(), 1.25)
+            self.assertAlmostEqual(editor.end.value(), 2.25)
+            editor.reject()
+
+    def test_master_volume_is_clamped_and_saved_as_percent(self):
+        from PyQt6.QtWidgets import QWidget
+        from clipper.library import Library
+        from clipper.editor import Editor
+        info = {'streams': [{'codec_type': 'video', 'index': 0, 'duration': '4',
+                             'codec_name': 'h264', 'avg_frame_rate': '30/1'}],
+                'format': {'duration': '4'}}
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d); path = root / 'source.mp4'; path.touch()
+            parent = QWidget(); parent.library = Library(root / 'db.sqlite'); parent.data_path = root
+            parent.library.set_setting('master_volume', '175')
+            editor = Editor(path, parent, info=info)
+            self.assertEqual(editor.listen_volume.maximum(), 150)
+            self.assertEqual(editor.listen_volume.value(), 150)
+            editor.listen_volume.setValue(125)
+            editor.reject()
+            self.assertEqual(parent.library.setting('master_volume'), '125')
+            parent.library.close()
 
     def test_editor_displays_and_preserves_saved_track_names(self):
         from PyQt6.QtWidgets import QLabel, QWidget

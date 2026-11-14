@@ -5,3 +5,4 @@ build/
 dist/
 *.spec
 *.sqlite3
+*.egg-info/

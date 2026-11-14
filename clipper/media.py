@@ -140,6 +140,12 @@ def _temporary(dest):
     os.close(fd)
     return Path(name)
 
+def _can_copy_audio(stream, dest):
+    if Path(dest).suffix.casefold() not in ('.mp4', '.mov', '.m4v'):
+        return True
+    return str(stream.get('codec_name', '')).casefold() in {'aac', 'mp3', 'mp2', 'alac', 'ac3', 'eac3'}
+
+
 def trim(source, dest, start, end, volumes=None, mix_first=False, progress=None, cancellation=None):
     """Copy video losslessly; copy unchanged audio or re-encode adjusted tracks."""
     dest = Path(dest)
@@ -175,18 +181,18 @@ def trim(source, dest, start, end, volumes=None, mix_first=False, progress=None,
             filters.append(f'{inputs}amix=inputs={len(audios)-1}:normalize=0,volume={master}[mixout]')
             cmd += ['-filter_complex', ';'.join(filters), '-map', '[mixout]']
             for i, stream in enumerate(audios[1:]):
-                unchanged = float(volumes.get(stream['index'], 1.0)) == 1.0
+                unchanged = float(volumes.get(stream['index'], 1.0)) == 1.0 and _can_copy_audio(stream, dest)
                 cmd += ['-map', f"0:{stream['index']}" if unchanged else f'[track{i}]']
             cmd += ['-c:a:0', 'aac', '-b:a:0', '192k']
             for i, stream in enumerate(audios[1:], 1):
-                unchanged = float(volumes.get(stream['index'], 1.0)) == 1.0
+                unchanged = float(volumes.get(stream['index'], 1.0)) == 1.0 and _can_copy_audio(stream, dest)
                 cmd += [f'-c:a:{i}', 'copy' if unchanged else 'aac']
                 if not unchanged: cmd += [f'-b:a:{i}', '192k']
         else:
             for index, stream in enumerate(audios):
                 volume = float(volumes.get(stream['index'], 1.0))
                 cmd += ['-map', f"0:{stream['index']}"]
-                if volume == 1.0:
+                if volume == 1.0 and _can_copy_audio(stream, dest):
                     cmd += [f'-c:a:{index}', 'copy']
                 else:
                     cmd += [f'-c:a:{index}', 'aac', f'-b:a:{index}', '192k', f'-filter:a:{index}', f'volume={volume}']

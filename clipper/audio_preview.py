@@ -76,7 +76,7 @@ class AudioPreview(QObject):
     def set_master(self, value):
         if self.closed: return
         self.master = value
-        self._volumes_changed()
+        self._levels_changed()
 
     def set_muted(self, value):
         if self.closed: return
@@ -94,9 +94,12 @@ class AudioPreview(QObject):
             master = levels[0]; levels = [0] + [gain * master for gain in levels[1:]]
         return tuple(zip(self.indices, levels))
 
+    def _output_levels(self):
+        return tuple((index, gain * self.master) for index, gain in self._effective_levels())
+
     def _levels_changed(self):
         if self.closed: return
-        levels = self._effective_levels()
+        levels = self._output_levels()
         requires_render = any(gain > 1 for _, gain in levels)
         if requires_render:
             self.render_mode = True
@@ -162,10 +165,11 @@ class AudioPreview(QObject):
 
     def _volumes_changed(self):
         if self.closed: return
-        for index, gain in self._effective_levels():
-            self.outputs[index].setVolume(min(1.0, max(0.0, gain * self.master)))
+        for index, gain in self._output_levels():
+            self.outputs[index].setVolume(min(1.0, max(0.0, gain)))
             self.outputs[index].setMuted(self.muted or (self.render_mode and self.render_ready) or index not in self.ready)
-        self.render_output.setVolume(min(1.0, max(0.0, self.master)))
+        # Rendered samples already include both track gains and master volume.
+        self.render_output.setVolume(1.0)
         self.render_output.setMuted(self.muted or not self.render_mode or not self.render_ready)
 
     def _state_changed(self, state):
